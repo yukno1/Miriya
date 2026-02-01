@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="Sandbox/Sandbox.vcxproj" Id="11dc3697-60c8-4d98-a533-afca4f3170ee" />
+  <Project Path="Miriya/Miriya.vcxproj" Id="0d185281-2f73-4f21-8aa4-5ef877878fbf">
+    <BuildType Project="Debug" />
+  </Project>
+</Solution>
