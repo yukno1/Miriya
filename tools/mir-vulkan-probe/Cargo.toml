@@ -1,0 +1,14 @@
+[package]
+name = "mir-vulkan-probe"
+version.workspace = true
+edition.workspace = true
+description = "M0 spike: probe Vulkan 1.3 + vulkanalia + winit surface compatibility"
+
+[[bin]]
+name = "mir-vulkan-probe"
+path = "src/main.rs"
+
+[dependencies]
+vulkanalia = { version = "0.35", features = ["libloading", "window"] }
+raw-window-handle = "0.6"
+winit = "0.30"
