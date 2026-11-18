@@ -1,0 +1,5 @@
+[package]
+name = "mir-nav"
+version.workspace = true
+edition.workspace = true
+description = "Miriya navigation and AI"

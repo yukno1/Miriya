@@ -1,0 +1,5 @@
+[package]
+name = "mir-animation"
+version.workspace = true
+edition.workspace = true
+description = "Miriya animation subsystem"

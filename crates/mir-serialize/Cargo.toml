@@ -1,0 +1,5 @@
+[package]
+name = "mir-serialize"
+version.workspace = true
+edition.workspace = true
+description = "Miriya versioned serialization"

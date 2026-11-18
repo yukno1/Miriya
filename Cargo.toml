@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    "tools/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+miriya-engine = { path = "crates/miriya-engine" }

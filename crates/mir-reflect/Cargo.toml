@@ -1,0 +1,5 @@
+[package]
+name = "mir-reflect"
+version.workspace = true
+edition.workspace = true
+description = "Miriya reflection metadata and derive support"

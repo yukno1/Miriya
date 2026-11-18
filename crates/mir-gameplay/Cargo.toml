@@ -1,0 +1,5 @@
+[package]
+name = "mir-gameplay"
+version.workspace = true
+edition.workspace = true
+description = "Miriya gameplay framework"

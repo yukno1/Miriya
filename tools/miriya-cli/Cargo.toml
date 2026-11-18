@@ -1,0 +1,9 @@
+[package]
+name = "miriya-cli"
+version.workspace = true
+edition.workspace = true
+description = "Miriya command line tools"
+
+[[bin]]
+name = "miriya-cli"
+path = "src/main.rs"

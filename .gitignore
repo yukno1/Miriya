@@ -1,0 +1,8 @@
+/target
+
+managed/**/bin/
+managed/**/obj/
+*.pdb
+*.user
+.vs/
+.idea/

@@ -1,0 +1,8 @@
+[package]
+name = "mir-editor-egui"
+version.workspace = true
+edition.workspace = true
+description = "Miriya editor egui backend"
+
+[dependencies]
+mir-editor-ui = { path = "../mir-editor-ui" }

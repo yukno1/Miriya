@@ -1,0 +1,5 @@
+[package]
+name = "mir-physics"
+version.workspace = true
+edition.workspace = true
+description = "Miriya physics backend interface (no solver)"

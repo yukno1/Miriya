@@ -1,0 +1,10 @@
+[package]
+name = "mir-core"
+version.workspace = true
+edition.workspace = true
+description = "Miriya engine core loop and lifecycle"
+
+[dependencies]
+mir-asset = { path = "../mir-asset" }
+mir-input = { path = "../mir-input" }
+mir-render = { path = "../mir-render" }

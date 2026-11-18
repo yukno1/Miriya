@@ -1,0 +1,5 @@
+[package]
+name = "mir-platform"
+version.workspace = true
+edition.workspace = true
+description = "Miriya platform services"

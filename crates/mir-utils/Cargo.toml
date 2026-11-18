@@ -1,0 +1,5 @@
+[package]
+name = "mir-utils"
+version.workspace = true
+edition.workspace = true
+description = "Miriya shared utilities"

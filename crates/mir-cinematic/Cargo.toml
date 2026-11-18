@@ -1,0 +1,5 @@
+[package]
+name = "mir-cinematic"
+version.workspace = true
+edition.workspace = true
+description = "Miriya cinematic/sequencer"

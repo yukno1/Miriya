@@ -1,0 +1,12 @@
+[package]
+name = "miriya-app"
+version.workspace = true
+edition.workspace = true
+description = "Miriya demo application"
+
+[[bin]]
+name = "miriya"
+path = "src/main.rs"
+
+[dependencies]
+miriya-engine = { workspace = true }

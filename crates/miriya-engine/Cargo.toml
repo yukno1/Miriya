@@ -1,0 +1,17 @@
+[package]
+name = "miriya-engine"
+version.workspace = true
+edition.workspace = true
+description = "Miriya game engine facade crate"
+
+[dependencies]
+# 引擎子系统
+mir-core = { path = "../mir-core" }
+mir-math = { path = "../mir-math" }
+mir-ecs = { path = "../mir-ecs" }
+mir-input = { path = "../mir-input" }
+mir-asset = { path = "../mir-asset" }
+mir-render = { path = "../mir-render" }
+mir-window = { path = "../mir-window" }
+mir-scene = { path = "../mir-scene" }
+mir-log = { path = "../mir-log" }

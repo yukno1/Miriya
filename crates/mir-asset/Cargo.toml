@@ -1,0 +1,7 @@
+[package]
+name = "mir-asset"
+version.workspace = true
+edition.workspace = true
+description = "Miriya asset system"
+
+[dependencies]

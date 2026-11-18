@@ -1,0 +1,8 @@
+[package]
+name = "mir-input"
+version.workspace = true
+edition.workspace = true
+description = "Miriya input system"
+
+[dependencies]
+mir-math = { path = "../mir-math" }

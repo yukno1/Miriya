@@ -1,0 +1,7 @@
+[package]
+name = "mir-render"
+version.workspace = true
+edition.workspace = true
+description = "Miriya render abstraction"
+
+[dependencies]

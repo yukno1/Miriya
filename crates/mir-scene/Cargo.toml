@@ -1,0 +1,9 @@
+[package]
+name = "mir-scene"
+version.workspace = true
+edition.workspace = true
+description = "Miriya scene system"
+
+[dependencies]
+mir-ecs = { path = "../mir-ecs" }
+mir-math = { path = "../mir-math" }

@@ -1,0 +1,5 @@
+[package]
+name = "mir-image"
+version.workspace = true
+edition.workspace = true
+description = "Miriya image decoding"

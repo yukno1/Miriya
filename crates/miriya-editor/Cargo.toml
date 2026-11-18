@@ -1,0 +1,21 @@
+[package]
+name = "miriya-editor"
+version.workspace = true
+edition.workspace = true
+description = "Miriya editor composition root"
+
+[[bin]]
+name = "miriya-editor"
+path = "src/main.rs"
+
+[dependencies]
+miriya-engine = { workspace = true }
+mir-editor-core = { path = "../mir-editor-core" }
+mir-editor-ui = { path = "../mir-editor-ui" }
+mir-editor-gpui = { path = "../mir-editor-gpui", optional = true }
+mir-editor-egui = { path = "../mir-editor-egui", optional = true }
+
+[features]
+default = []
+gpui = ["dep:mir-editor-gpui"]
+egui = ["dep:mir-editor-egui"]

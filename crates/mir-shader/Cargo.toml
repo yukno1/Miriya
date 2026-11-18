@@ -1,0 +1,5 @@
+[package]
+name = "mir-shader"
+version.workspace = true
+edition.workspace = true
+description = "Miriya GLSL/SPIR-V shader pipeline"

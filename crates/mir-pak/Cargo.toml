@@ -1,0 +1,5 @@
+[package]
+name = "mir-pak"
+version.workspace = true
+edition.workspace = true
+description = "Miriya asset packaging (.mipak)"

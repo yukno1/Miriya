@@ -1,0 +1,8 @@
+[package]
+name = "mir-editor-gpui"
+version.workspace = true
+edition.workspace = true
+description = "Miriya editor GPUI backend"
+
+[dependencies]
+mir-editor-ui = { path = "../mir-editor-ui" }

@@ -1,0 +1,5 @@
+[package]
+name = "mir-object"
+version.workspace = true
+edition.workspace = true
+description = "Miriya object, handle and lifetime model"

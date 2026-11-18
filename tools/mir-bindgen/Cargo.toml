@@ -1,0 +1,5 @@
+[package]
+name = "mir-bindgen"
+version.workspace = true
+edition.workspace = true
+description = "Miriya C# binding generator"

@@ -1,0 +1,5 @@
+[package]
+name = "mir-vfx"
+version.workspace = true
+edition.workspace = true
+description = "Miriya VFX/particles"

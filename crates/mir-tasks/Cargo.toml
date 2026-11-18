@@ -1,0 +1,5 @@
+[package]
+name = "mir-tasks"
+version.workspace = true
+edition.workspace = true
+description = "Miriya CPU job system"

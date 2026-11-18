@@ -1,0 +1,8 @@
+[package]
+name = "mir-editor-ui"
+version.workspace = true
+edition.workspace = true
+description = "Miriya editor UI host contract"
+
+[dependencies]
+mir-editor-core = { path = "../mir-editor-core" }

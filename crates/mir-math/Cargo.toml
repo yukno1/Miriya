@@ -1,0 +1,8 @@
+[package]
+name = "mir-math"
+version.workspace = true
+edition.workspace = true
+description = "Miriya math library"
+
+[dependencies]
+glam = "0.34.3"

@@ -1,0 +1,5 @@
+[package]
+name = "mir-uasset"
+version.workspace = true
+edition.workspace = true
+description = "Miriya optional UE package import"
