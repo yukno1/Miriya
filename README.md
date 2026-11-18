@@ -369,8 +369,9 @@ miriya-editor（组合根，选择 UI 后端）
 
 ### 6.1 当前结构（M0 骨架已落地）
 
-workspace 已按目标结构拍平，`cargo metadata` 验证为 **40 个成员**；其中 11 个保留现有实现
-（门面、示例、9 个引擎子 crate），其余 29 个为仅含模块文档的结构占位。
+workspace 已按目标结构拍平，`cargo metadata` 验证为 **41 个成员**（37 个 crates + 4 个 tools）；
+其中 11 个保留现有实现（门面、示例、9 个引擎子 crate），新增 `mir-vulkan-probe` PoC 工具，
+其余 29 个为仅含模块文档的结构占位。
 
 ```text
 Miriya/
@@ -387,7 +388,7 @@ Miriya/
 │   └── mir-{tasks,utils,reflect,object,serialize,shader,platform,
 │            physics,audio,animation,ui,gameplay,net,cinematic,nav,
 │            vfx,pak,image,uasset,script,terrain}/                 # 其余规划 crate（占位）
-├── tools/                      # miriya-cli、mir-build、mir-bindgen（占位）
+├── tools/                      # miriya-cli、mir-build、mir-bindgen（占位）+ mir-vulkan-probe（PoC）
 ├── managed/                    # Miriya.Runtime / Miriya.Scripting（csproj 空壳）
 ├── assets/ config/ shaders/ tests/ docs/{adr,book,rfcs}/          # 占位目录
 └── target/                     # 构建产物（git 忽略）
@@ -990,8 +991,8 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 
 ### 14.1 已完成
 
-- [x] workspace 已按目标结构拍平并收敛：**40 个成员**（37 个 crates + 3 个 tools）；9 个引擎子 crate
-  保留原型，29 个空壳 crate 仅含模块文档。
+- [x] workspace 已按目标结构拍平并收敛：**41 个成员**（37 个 crates + 4 个 tools，含 `mir-vulkan-probe` PoC）；
+  9 个引擎子 crate 保留原型，29 个空壳 crate 仅含模块文档。
 - [x] `rust-toolchain.toml`、`.editorconfig`、`managed/`、`docs/`、`assets/`、`config/`、`shaders/`、`tests/` 骨架。
 - [x] 基础主循环（`AppState` 回调、帧率限制、时间推进）。
 - [x] 数学 newtype 封装（Vec/Mat/Quat）与单元测试。
@@ -1008,6 +1009,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   方向键/修饰键；`mir-input` 补全鼠标按键沿与失焦清理；窗口关闭、Esc、`max_frames` 均可退出主循环。
 - [x] 帧统计 `FrameStats`（帧数、平滑 FPS、帧耗时）接入 `EngineContext`；`Engine::run_headless` 支持
   无窗口跑帧，新增 `headless_1000_frames` 测试。
+- [x] M0 遗留：`vulkanalia` PoC 全链路实测通过（RFC 0001），首批 10 篇 ADR 落盘 `docs/adr/`。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
@@ -1019,8 +1021,8 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化但尚无提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
-7. 现有骨架尚未引入 `vulkanalia` 与 .NET 8 宿主；`mir-script`、`mir-bindgen`、`managed/` 已创建空壳，
-   需要 M0 spike、M2（Vulkan）与 M8（C#）落地。
+7. `vulkanalia` 已在 PoC 工具中验证（RFC 0001），但尚未引入 `mir-render`；.NET 8 宿主未接入；
+   `mir-script`、`mir-bindgen`、`managed/` 仍为空壳，需 M2 与 M8 落地。
 8. 当前没有物理实现（这是新约束）：`mir-physics` 仅为接口空壳，v0.4 起需要接入外部自研后端。
 9. 编辑器 UI 后端尚未选定：`mir-editor-core` 等已创建空壳，GPUI/egui 需在 M12 前完成 spike 与 ADR-0009。
 
@@ -1038,6 +1040,9 @@ cargo run -- --frames 120
 
 # 无窗口跑帧（CI/headless 验证）
 cargo run -- --headless --frames 1000
+
+# Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
+cargo run -p mir-vulkan-probe
 ```
 
 `cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
@@ -1046,18 +1051,20 @@ cargo run -- --headless --frames 1000
 
 ### 14.4 下一步（M0 任务清单）
 
-- [x] 子 crate 加入 workspace（已拍平，`members = ["crates/*", "tools/*"]`，40 个成员）。
+- [x] 子 crate 加入 workspace（已拍平，`members = ["crates/*", "tools/*"]`，41 个成员）。
 - [x] 修复门面 re-export：`miriya-engine` 已导出 `mir_log` 等 9 个原型子系统；
       新模块接入时继续检查依赖方向。
 - [x] 添加 `rust-toolchain.toml`、`.editorconfig`。
 - [x] 添加 `LICENSE-MIT`、`LICENSE-APACHE`、`global.json`。
 - [x] CI：Windows（fmt/clippy/test + .NET 8 `dotnet build`）+ Linux `cargo check`（接口检查）；已配置 Cargo 缓存。
-- [ ] 完成 `vulkanalia`（Vulkan 设备/交换链）与 .NET 8 hostfxr 托管的最小 PoC，形成风险结论。
+- [x] `vulkanalia` 最小 PoC（`tools/mir-vulkan-probe`）：实例/物理设备/逻辑设备/surface/交换链前置查询全链路
+      本机实测通过（Loader 1.4.341、Intel Iris Xe、Vulkan 1.3、B8G8R8A8_UNORM/IMMEDIATE），
+      风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 8 hostfxr 托管 PoC 属 M8 前置。
 - [ ] 起草 `PhysicsBackend` 契约与 `mir-editor-core` 边界（UI 无关），供 M6/M12 使用。
 - [x] 建立 `docs/adr/` 目录。
-- [ ] 撰写首批 ADR（0001 布局、0002 ECS、0003 坐标系、0004 渲染管线、
-      0005 Vulkan 单后端、0006 C# 脚本运行时、0007 Windows-only/Linux 接口、
-      0008 物理后端接口、0009 编辑器 UI 后端选型、0010 Rust-first API/1:1 边界）。
+- [x] 撰写首批 ADR 0001–0010（布局、ECS、坐标系、渲染管线、Vulkan 单后端、C# 脚本运行时、
+      Windows-only/Linux 接口、物理后端接口、编辑器 UI 后端选型、Rust-first API/1:1 边界）；
+      其中 ADR-0009 为 Proposed，待 M12 spike 定稿。
 - [x] 主循环可退出 + headless 测试：`max_frames` / 窗口关闭 / Esc 均可退出；`headless_1000_frames` 通过。
 - [x] M1：winit 窗口与事件循环、键鼠映射、输入快照、帧统计、退出链路（Linux CI 已装 X11/Wayland 依赖）。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）。
