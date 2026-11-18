@@ -5,3 +5,5 @@ edition.workspace = true
 description = "Miriya window abstraction"
 
 [dependencies]
+mir-input = { path = "../mir-input" }
+winit = "0.30"
