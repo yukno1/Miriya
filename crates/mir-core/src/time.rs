@@ -1,4 +1,4 @@
-//! 时间系统：帧间隔、运行时长。
+//! 时间系统：帧间隔、运行时长、帧统计。
 
 use std::time::Instant;
 
@@ -44,5 +44,28 @@ impl Time {
 impl Default for Time {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 帧统计：帧数、平滑 FPS、上一帧耗时。
+#[derive(Debug, Clone, Default)]
+pub struct FrameStats {
+    pub frames: u64,
+    pub fps: f32,
+    pub frame_time_ms: f32,
+}
+
+impl FrameStats {
+    pub(crate) fn update(&mut self, dt: f32) {
+        self.frames += 1;
+        self.frame_time_ms = dt * 1000.0;
+        if dt > 0.0 {
+            let instant = 1.0 / dt;
+            self.fps = if self.fps == 0.0 {
+                instant
+            } else {
+                self.fps * 0.9 + instant * 0.1
+            };
+        }
     }
 }

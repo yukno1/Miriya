@@ -1004,17 +1004,21 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   （Windows: fmt/clippy/test + .NET 8 构建；Linux: `cargo check`）。
 - [x] 主循环支持 `max_frames`，示例 `miriya-app` 可通过 `--frames N` 自动退出，不再只能 Ctrl+C 强杀。
 - [x] 渲染/窗口子系统文档注释已对齐唯一后端 `vulkanalia` / `winit` 规划。
+- [x] **M1 平台与循环**：`mir-window` 接入 winit 0.30 真实窗口与事件循环；键位映射覆盖字母/数字/F1–F12/
+  方向键/修饰键；`mir-input` 补全鼠标按键沿与失焦清理；窗口关闭、Esc、`max_frames` 均可退出主循环。
+- [x] 帧统计 `FrameStats`（帧数、平滑 FPS、帧耗时）接入 `EngineContext`；`Engine::run_headless` 支持
+  无窗口跑帧，新增 `headless_1000_frames` 测试。
 
-### 14.2 已知问题（M0 优先修复）
+### 14.2 已知问题（按里程碑优先修复）
 
 1. 29 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 9 个原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` / `mir-window` 是占位实现：`Engine::run` 没有窗口事件来源，`exit_requested` 只能由代码置位；
-   示例可通过 `--frames N` 自动退出，但 M1 前仍无真实窗口关闭事件。
-4. `mir-input` 仅 6 个可用键位（另有 `Unknown`）且未与窗口事件连接；`mir-asset` 加载失败直接 `panic`。
+3. `mir-render` 仍是占位实现：`init`/`begin_frame`/`end_frame` 无实际 GPU 工作；窗口尺寸变化已记录，
+   但未创建 Vulkan swapchain（M2 范围）。
+4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化但尚无提交。
-6. `EngineConfig` 的宽高只传给渲染上下文，未创建真实 surface，也未处理 DPI/缩放。
+6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
 7. 现有骨架尚未引入 `vulkanalia` 与 .NET 8 宿主；`mir-script`、`mir-bindgen`、`managed/` 已创建空壳，
    需要 M0 spike、M2（Vulkan）与 M8（C#）落地。
 8. 当前没有物理实现（这是新约束）：`mir-physics` 仅为接口空壳，v0.4 起需要接入外部自研后端。
@@ -1027,13 +1031,17 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 cargo check --workspace
 cargo test --workspace
 
-# 运行示例（占位渲染；--frames N 限定帧数后自动退出，便于 headless 验证）
+# 运行示例（打开真实窗口；Esc 或点击关闭按钮退出，也可 --frames N 自动退出）
+cargo run -p miriya-app
 cargo run -p miriya-app -- --frames 120
+
+# 无窗口跑帧（CI/headless 验证）
+cargo run -p miriya-app -- --headless --frames 1000
 ```
 
-`cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 dead_code / unused dependency 警告）；
-示例可用 `--frames` 自动退出；M1 完成后将打开真实窗口，关闭窗口即可退出；
-M8 起还需要 .NET 8 SDK 编译 C# 脚本。
+`cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
+窗口由 winit 创建，关闭窗口或按 Esc 均通过 `request_exit` 退出；`Engine::run_headless` 不创建事件循环，
+用于 headless 1000 帧测试。M8 起还需要 .NET 8 SDK 编译 C# 脚本。
 
 ### 14.4 下一步（M0 任务清单）
 
@@ -1049,8 +1057,8 @@ M8 起还需要 .NET 8 SDK 编译 C# 脚本。
 - [ ] 撰写首批 ADR（0001 布局、0002 ECS、0003 坐标系、0004 渲染管线、
       0005 Vulkan 单后端、0006 C# 脚本运行时、0007 Windows-only/Linux 接口、
       0008 物理后端接口、0009 编辑器 UI 后端选型、0010 Rust-first API/1:1 边界）。
-- [x] 主循环可退出 + headless 测试：通过 `EngineConfig::max_frames` / `--frames` 实现；
-      真实窗口关闭退出仍属 M1 范围。
+- [x] 主循环可退出 + headless 测试：`max_frames` / 窗口关闭 / Esc 均可退出；`headless_1000_frames` 通过。
+- [x] M1：winit 窗口与事件循环、键鼠映射、输入快照、帧统计、退出链路（Linux CI 已装 X11/Wayland 依赖）。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）。
 
 ---

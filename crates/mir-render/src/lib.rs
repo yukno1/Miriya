@@ -7,13 +7,17 @@
 pub struct RenderContext {
     pub exit_requested: bool,
     initialized: bool,
+    width: u32,
+    height: u32,
 }
 
 impl RenderContext {
-    pub fn new(_width: u32, _height: u32) -> Self {
+    pub fn new(width: u32, height: u32) -> Self {
         Self {
             exit_requested: false,
             initialized: false,
+            width,
+            height,
         }
     }
 
@@ -24,6 +28,17 @@ impl RenderContext {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// 当前渲染目标尺寸（随窗口缩放更新）。
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 窗口缩放时更新渲染目标尺寸。
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
     }
 
     /// 清屏并开始本帧渲染。

@@ -3,7 +3,9 @@
 pub mod time;
 
 use std::time::Instant;
-use time::Time;
+
+use mir_window::{ButtonState, WindowApp, WindowEvent};
+use time::{FrameStats, Time};
 
 /// 引擎配置。
 #[derive(Debug, Clone)]
@@ -49,12 +51,103 @@ pub struct EngineContext {
     pub input: mir_input::InputState,
     pub renderer: mir_render::RenderContext,
     pub assets: mir_asset::AssetServer,
+    pub stats: FrameStats,
 }
 
 impl EngineContext {
     /// 请求退出引擎主循环。
     pub fn request_exit(&mut self) {
         self.renderer.exit_requested = true;
+    }
+
+    /// 平台层：把窗口事件翻译成输入状态与退出请求。
+    pub fn on_window_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.request_exit(),
+            WindowEvent::Resized { width, height } => self.renderer.resize(width, height),
+            WindowEvent::Keyboard { key, state } => match state {
+                ButtonState::Pressed => self.input.press(key),
+                ButtonState::Released => self.input.release(key),
+            },
+            WindowEvent::CursorMoved { x, y } => {
+                self.input.set_mouse_pos(mir_math::Vec2::new(x, y));
+            }
+            WindowEvent::MouseButton { button, state } => match state {
+                ButtonState::Pressed => self.input.press_mouse(button),
+                ButtonState::Released => self.input.release_mouse(button),
+            },
+            WindowEvent::Focused(false) => self.input.clear(),
+            WindowEvent::Focused(true) => {}
+        }
+    }
+}
+
+fn frame_target(config: &EngineConfig) -> Option<f64> {
+    if config.target_fps > 0 {
+        Some(1.0 / config.target_fps as f64)
+    } else {
+        None
+    }
+}
+
+fn make_context(config: &EngineConfig) -> EngineContext {
+    EngineContext {
+        time: Time::new(),
+        input: mir_input::InputState::default(),
+        renderer: mir_render::RenderContext::new(config.width, config.height),
+        assets: mir_asset::AssetServer::new(),
+        stats: FrameStats::default(),
+    }
+}
+
+/// 驱动一帧：时间推进 → 逻辑 → 渲染 → 帧统计 → 清理输入沿 → 帧率限制。
+fn tick(
+    ctx: &mut EngineContext,
+    app: &mut dyn AppState,
+    frame_start: Instant,
+    target: Option<f64>,
+) {
+    ctx.time.update();
+    let dt = ctx.time.delta_secs();
+    app.on_update(ctx, dt);
+    app.on_render(ctx);
+    ctx.stats.update(dt);
+    ctx.input.end_frame();
+
+    if let Some(target) = target {
+        let elapsed = frame_start.elapsed().as_secs_f64();
+        if elapsed < target {
+            std::thread::sleep(std::time::Duration::from_secs_f64(target - elapsed));
+        }
+    }
+}
+
+/// 把引擎主循环适配为窗口事件循环的回调。
+struct FrameDriver<'a> {
+    config: EngineConfig,
+    ctx: EngineContext,
+    app: &'a mut dyn AppState,
+}
+
+impl WindowApp for FrameDriver<'_> {
+    fn on_event(&mut self, event: WindowEvent) {
+        self.ctx.on_window_event(event);
+    }
+
+    fn on_frame(&mut self) {
+        let target = frame_target(&self.config);
+        tick(&mut self.ctx, self.app, Instant::now(), target);
+        if self
+            .config
+            .max_frames
+            .is_some_and(|max| self.ctx.stats.frames >= max)
+        {
+            self.ctx.request_exit();
+        }
+    }
+
+    fn should_exit(&self) -> bool {
+        self.ctx.renderer.exit_requested
     }
 }
 
@@ -68,49 +161,107 @@ impl Engine {
         Self { config }
     }
 
-    /// 运行引擎，直到 `AppState` 请求退出或窗口关闭。
+    /// 打开窗口并运行主循环，直到应用请求退出或窗口关闭。
     pub fn run(&self, app: &mut dyn AppState) {
-        let mut ctx = EngineContext {
-            time: Time::new(),
-            input: mir_input::InputState::default(),
-            renderer: mir_render::RenderContext::new(self.config.width, self.config.height),
-            assets: mir_asset::AssetServer::new(),
+        let mut driver = FrameDriver {
+            config: self.config.clone(),
+            ctx: make_context(&self.config),
+            app,
         };
+        driver.ctx.renderer.init();
+        driver.app.on_start(&mut driver.ctx);
 
+        let window_config = mir_window::WindowConfig {
+            title: self.config.title.clone(),
+            width: self.config.width,
+            height: self.config.height,
+        };
+        mir_window::run(window_config, &mut driver);
+
+        driver.app.on_exit(&mut driver.ctx);
+    }
+
+    /// 无窗口运行指定帧数（headless 测试用）；不创建事件循环。
+    pub fn run_headless(&self, app: &mut dyn AppState, frames: u64) {
+        let mut ctx = make_context(&self.config);
         ctx.renderer.init();
         app.on_start(&mut ctx);
 
-        let frame_target = if self.config.target_fps > 0 {
-            Some(1.0 / self.config.target_fps as f64)
-        } else {
-            None
-        };
-
-        let mut frames = 0u64;
-        while !ctx.renderer.exit_requested {
-            let frame_start = Instant::now();
-
-            ctx.input.end_frame(); // 清除上一帧的按键沿
-            ctx.time.update();
-
-            let dt = ctx.time.delta_secs();
-            app.on_update(&mut ctx, dt);
-            app.on_render(&mut ctx);
-
-            frames += 1;
-            if self.config.max_frames.is_some_and(|max| frames >= max) {
+        let target = frame_target(&self.config);
+        for _ in 0..frames {
+            tick(&mut ctx, app, Instant::now(), target);
+            if ctx.renderer.exit_requested {
                 break;
-            }
-
-            // 帧率限制
-            if let Some(target) = frame_target {
-                let elapsed = frame_start.elapsed().as_secs_f64();
-                if elapsed < target {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(target - elapsed));
-                }
             }
         }
 
         app.on_exit(&mut ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CountingApp {
+        updates: u64,
+        renders: u64,
+        started: bool,
+        exited: bool,
+    }
+
+    impl AppState for CountingApp {
+        fn on_start(&mut self, _ctx: &mut EngineContext) {
+            self.started = true;
+        }
+        fn on_update(&mut self, _ctx: &mut EngineContext, _dt: f32) {
+            self.updates += 1;
+        }
+        fn on_render(&mut self, _ctx: &mut EngineContext) {
+            self.renders += 1;
+        }
+        fn on_exit(&mut self, _ctx: &mut EngineContext) {
+            self.exited = true;
+        }
+    }
+
+    #[test]
+    fn headless_1000_frames() {
+        let engine = Engine::new(EngineConfig {
+            title: "headless".to_string(),
+            target_fps: 0,
+            ..Default::default()
+        });
+        let mut app = CountingApp {
+            updates: 0,
+            renders: 0,
+            started: false,
+            exited: false,
+        };
+        engine.run_headless(&mut app, 1000);
+        assert!(app.started);
+        assert!(app.exited);
+        assert_eq!(app.updates, 1000);
+        assert_eq!(app.renders, 1000);
+    }
+
+    #[test]
+    fn window_events_update_input_and_exit() {
+        let mut ctx = make_context(&EngineConfig::default());
+        ctx.on_window_event(WindowEvent::Keyboard {
+            key: mir_input::KeyCode::W,
+            state: ButtonState::Pressed,
+        });
+        assert!(ctx.input.is_down(mir_input::KeyCode::W));
+        assert!(ctx.input.just_pressed(mir_input::KeyCode::W));
+
+        ctx.on_window_event(WindowEvent::Resized {
+            width: 800,
+            height: 600,
+        });
+        assert_eq!(ctx.renderer.size(), (800, 600));
+
+        ctx.on_window_event(WindowEvent::CloseRequested);
+        assert!(ctx.renderer.exit_requested);
     }
 }
