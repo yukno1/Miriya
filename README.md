@@ -1032,11 +1032,12 @@ cargo check --workspace
 cargo test --workspace
 
 # 运行示例（打开真实窗口；Esc 或点击关闭按钮退出，也可 --frames N 自动退出）
-cargo run -p miriya-app
-cargo run -p miriya-app -- --frames 120
+# workspace 已设置 default-members，根目录直接 cargo run 即可
+cargo run
+cargo run -- --frames 120
 
 # 无窗口跑帧（CI/headless 验证）
-cargo run -p miriya-app -- --headless --frames 1000
+cargo run -- --headless --frames 1000
 ```
 
 `cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；

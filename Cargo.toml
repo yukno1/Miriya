@@ -4,6 +4,8 @@ members = [
     "crates/*",
     "tools/*",
 ]
+# 在根目录直接 `cargo run` / `cargo test` 时默认进入示例包
+default-members = ["crates/miriya-app"]
 
 [workspace.package]
 version = "0.1.0"

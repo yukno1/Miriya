@@ -3,6 +3,7 @@ name = "miriya-app"
 version.workspace = true
 edition.workspace = true
 description = "Miriya demo application"
+default-run = "miriya"
 
 [[bin]]
 name = "miriya"
