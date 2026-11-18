@@ -2,7 +2,7 @@
 
 - 日期：2026-11-18
 - 状态：已完成（Accepted）
-- 关联：M0 任务「vulkanalia / .NET 8 hostfxr 最小 PoC」的 Vulkan 部分；ADR-0005
+- 关联：M0 任务「vulkanalia / .NET 10 hostfxr 最小 PoC」的 Vulkan 部分；ADR-0005
 
 ## 摘要
 
