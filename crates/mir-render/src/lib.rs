@@ -28,6 +28,8 @@ pub enum RenderInitError {
     Surface(String),
     #[error("Vulkan swapchain creation failed: {0}")]
     Swapchain(String),
+    #[error("Vulkan frame resources initialization failed: {0}")]
+    FrameResources(String),
     #[error("renderer is already initialized")]
     AlreadyInitialized,
 }
@@ -60,6 +62,8 @@ pub struct RenderContext {
     height: u32,
     backend: Option<VulkanCore>,
     status: RendererStatus,
+    clear_color: [f32; 4],
+    frame_error: Option<String>,
 }
 
 impl RenderContext {
@@ -72,6 +76,8 @@ impl RenderContext {
             height,
             backend: None,
             status: RendererStatus::Uninitialized,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            frame_error: None,
         }
     }
 
@@ -149,26 +155,43 @@ impl RenderContext {
         &self.status
     }
 
+    /// 最近一帧的错误（无交换链/无后端时为 `None`）。
+    pub fn frame_error(&self) -> Option<&str> {
+        self.frame_error.as_deref()
+    }
+
     /// 当前渲染目标尺寸（随窗口缩放更新）。
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    /// 窗口缩放时更新渲染目标尺寸。
+    /// 窗口缩放时更新渲染目标尺寸，并重建交换链。
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+        if let Some(backend) = self.backend.as_mut()
+            && let Err(error) = backend.recreate_swapchain(width, height)
+        {
+            self.frame_error = Some(error);
+        }
     }
 
-    /// 清屏并开始本帧渲染（绘制逻辑待 M2/M5）。
+    /// 记录本帧清屏色（实际清屏在 `end_frame` 提交）。
     pub fn begin_frame(&mut self, clear_color: [f32; 4]) {
         debug_assert!(self.initialized);
-        let _ = clear_color;
+        self.clear_color = clear_color;
     }
 
-    /// 结束本帧渲染并呈现（提交/交换链 present 待 M2）。
+    /// 完成本帧：清屏 → 提交 → 呈现。headless 下为空操作。
     pub fn end_frame(&mut self) {
         debug_assert!(self.initialized);
+        if let Some(backend) = self.backend.as_mut() {
+            if let Err(error) = backend.render_frame(self.clear_color) {
+                self.frame_error = Some(error);
+            } else {
+                self.frame_error = None;
+            }
+        }
     }
 }
 

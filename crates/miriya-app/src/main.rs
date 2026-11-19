@@ -76,6 +76,9 @@ impl AppState for Game {
             "游戏退出：共 {} 帧，平均 {:.1} FPS",
             ctx.stats.frames, ctx.stats.fps
         );
+        if let Some(error) = ctx.renderer.frame_error() {
+            eprintln!("渲染帧错误：{error}");
+        }
     }
 }
 

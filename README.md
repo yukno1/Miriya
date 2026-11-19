@@ -468,7 +468,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链与图像视图；无实际绘制/present | 🟡 原型 | RenderGraph/绘制/present、交换链重建与验证层（M2） |
+| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染清屏与 present | 🟡 原型 | RenderGraph/几何绘制、验证层与多帧在飞行（M2） |
 | `mir-window` | winit 0.30 窗口与事件循环，实现 `HasWindowHandle`/`HasDisplayHandle`，窗口创建回调 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M1/M2） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
@@ -1025,15 +1025,17 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
       `WindowApp::on_window_created` 回调；`mir-core` 在窗口创建后用真实句柄初始化渲染；
       `mir-render` 创建交换链与图像视图（优先 IMMEDIATE，回退 FIFO；OPAQUE 合成），
       并按 image views → swapchain → surface → device → instance 逆序释放。窗口冒烟 `--frames 60` 通过。
+- [x] **M2 第三阶段**：`mir-render` 用 Vulkan 1.3 动态渲染完成每帧清屏，并经命令缓冲提交、`acquire →
+      present` 真正呈现到窗口；单帧在飞行（fence + 双 semaphore）同步，窗口缩放时重建交换链。
+      `frame_error()` 暴露帧级错误，示例应用退出时输出；`cargo run -- --frames 60` 无渲染错误。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已能创建 Vulkan 实例/设备/队列、surface 与交换链，但 `begin_frame`/`end_frame`
-   仍是空操作：尚未录制命令缓冲、acquire/present 与 RenderGraph；窗口缩放也尚未重建交换链，
-   验证层未启用（M2 剩余范围）。
+3. `mir-render` 已能清屏并 present，但当前只有清屏色、单帧在飞行：尚未绘制三角形/网格、
+   尚无 RenderGraph、深度与多帧在飞行；验证层未启用（M2 剩余范围）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
