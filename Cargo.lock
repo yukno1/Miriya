@@ -679,6 +679,10 @@ dependencies = [
 [[package]]
 name = "mir-editor-core"
 version = "0.1.0"
+dependencies = [
+ "mir-math",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mir-editor-egui"
@@ -746,6 +750,10 @@ version = "0.1.0"
 [[package]]
 name = "mir-physics"
 version = "0.1.0"
+dependencies = [
+ "mir-math",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mir-platform"

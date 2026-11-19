@@ -3,3 +3,7 @@ name = "mir-physics"
 version.workspace = true
 edition.workspace = true
 description = "Miriya physics backend interface (no solver)"
+
+[dependencies]
+mir-math = { path = "../mir-math" }
+thiserror.workspace = true
