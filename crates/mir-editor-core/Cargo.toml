@@ -3,3 +3,7 @@ name = "mir-editor-core"
 version.workspace = true
 edition.workspace = true
 description = "Miriya UI-agnostic editor core"
+
+[dependencies]
+mir-math = { path = "../mir-math" }
+thiserror.workspace = true
