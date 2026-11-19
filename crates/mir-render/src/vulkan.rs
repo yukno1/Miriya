@@ -15,6 +15,7 @@ use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
+use crate::mesh::{MeshData, MeshHandle, indices_as_bytes, vertices_as_bytes};
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
 
@@ -43,6 +44,23 @@ struct DepthResources {
     view: vk::ImageView,
 }
 
+/// 一个已上传到显存的网格（顶点/索引各一次独立分配，v0.2 无子分配器）。
+struct GpuMesh {
+    vertex_buffer: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    index_memory: vk::DeviceMemory,
+    /// 绘制时读取（V-13 提交 API）。
+    #[allow(dead_code)]
+    index_count: u32,
+}
+
+/// 网格槽位：世代号用于让销毁后的旧 [`MeshHandle`] 自动失效。
+struct MeshSlot {
+    generation: u32,
+    mesh: Option<GpuMesh>,
+}
+
 /// Vulkan 核心对象。按 pipeline → frame → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
     pipeline: Option<PipelineResources>,
@@ -63,6 +81,11 @@ pub(super) struct VulkanCore {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    /// 上传/布局转换专用的命令池与命令缓冲（同步使用，不参与每帧录制）。
+    transfer_pool: vk::CommandPool,
+    transfer_command_buffer: vk::CommandBuffer,
+    meshes: Vec<MeshSlot>,
+    free_meshes: Vec<u32>,
     graphics_family: u32,
     present_family: u32,
     device_name: String,
@@ -284,6 +307,24 @@ impl VulkanCore {
         let graphics_queue = unsafe { device.get_device_queue(graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(present_family, 0) };
 
+        // 上传/布局转换用独立命令池：不依赖每帧资源，headless 下也能创建网格。
+        let pool_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(graphics_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: graphics_family 是本设备支持的队列族。
+        let transfer_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .map_err(|error| RenderInitError::Transfer(error.to_string()))?;
+        let allocate_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(transfer_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: transfer_pool 有效，请求一个主命令缓冲。
+        let transfer_command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }
+            .map_err(|error| RenderInitError::Transfer(error.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RenderInitError::Transfer("传输命令缓冲分配结果为空".into()))?;
+
         let (surface_format, present_mode, format_value, mode_value) = match surface {
             Some(surface) => {
                 // SAFETY: physical_device 与 surface 均有效且仍存活。
@@ -336,6 +377,10 @@ impl VulkanCore {
             physical_device,
             graphics_queue,
             present_queue,
+            transfer_pool,
+            transfer_command_buffer,
+            meshes: Vec::new(),
+            free_meshes: Vec::new(),
             graphics_family,
             present_family,
             device_name,
@@ -639,11 +684,7 @@ impl VulkanCore {
         image: vk::Image,
         subresource: vk::ImageSubresourceRange,
     ) -> Result<(), String> {
-        let command_buffer = self
-            .frame
-            .as_ref()
-            .ok_or_else(|| "帧资源尚未初始化".to_string())?
-            .command_buffer;
+        let command_buffer = self.transfer_command_buffer;
         let no_memory_barriers: [vk::MemoryBarrier; 0] = [];
         let no_buffer_barriers: [vk::BufferMemoryBarrier; 0] = [];
         let barrier = vk::ImageMemoryBarrier::builder()
@@ -700,6 +741,243 @@ impl VulkanCore {
                 self.device.free_memory(depth.memory, None);
             }
         }
+    }
+
+    /// 创建 GPU 网格：staging → device-local，阻塞式上传（v0.2 网格极少，成本可忽略）。
+    pub(super) fn create_mesh(&mut self, data: &MeshData) -> Result<MeshHandle, String> {
+        if !data.is_valid() {
+            return Err("网格数据无效：顶点/索引为空或索引越界".to_string());
+        }
+        let mesh = self.upload_mesh(data)?;
+
+        let index = self.free_meshes.pop().unwrap_or(self.meshes.len() as u32);
+        let generation = self
+            .meshes
+            .get(index as usize)
+            .map(|slot| slot.generation)
+            .unwrap_or(0);
+        let slot = MeshSlot {
+            generation,
+            mesh: Some(mesh),
+        };
+        if index as usize == self.meshes.len() {
+            self.meshes.push(slot);
+        } else {
+            self.meshes[index as usize] = slot;
+        }
+        Ok(MeshHandle::from_parts(index, generation))
+    }
+
+    /// 销毁网格；句柄无效或世代不匹配时返回 `false`（旧句柄不会误删新网格）。
+    pub(super) fn destroy_mesh(&mut self, handle: MeshHandle) -> bool {
+        let index = handle.index();
+        let Some(slot) = self.meshes.get(index) else {
+            return false;
+        };
+        if slot.generation != handle.generation() {
+            return false;
+        }
+
+        let mesh = self.meshes[index].mesh.take();
+        self.meshes[index].generation = handle.generation().wrapping_add(1);
+        self.free_meshes.push(index as u32);
+        if let Some(mesh) = mesh {
+            self.release_mesh(mesh);
+        }
+        true
+    }
+
+    fn release_mesh(&self, mesh: GpuMesh) {
+        // SAFETY: 网格缓冲由本设备创建，且调用方保证 GPU 侧不再使用（创建/销毁均同步）。
+        unsafe {
+            self.device.destroy_buffer(mesh.vertex_buffer, None);
+            self.device.free_memory(mesh.vertex_memory, None);
+            self.device.destroy_buffer(mesh.index_buffer, None);
+            self.device.free_memory(mesh.index_memory, None);
+        }
+    }
+
+    fn destroy_all_meshes(&mut self) {
+        // 先收集再释放，避免同时借用 `self.meshes` 与 `self.device`。
+        let meshes: Vec<GpuMesh> = self
+            .meshes
+            .iter_mut()
+            .filter_map(|slot| slot.mesh.take())
+            .collect();
+        for mesh in meshes {
+            self.release_mesh(mesh);
+        }
+    }
+
+    /// 分配 buffer 并绑定设备内存。
+    fn create_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        let info = vk::BufferCreateInfo::builder()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: BufferCreateInfo 有效。
+        let buffer = unsafe { self.device.create_buffer(&info, None) }
+            .map_err(|error| format!("创建缓冲失败: {error}"))?;
+        // SAFETY: buffer 刚由本设备创建。
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = self.find_memory_type(requirements.memory_type_bits, properties)?;
+        let allocate_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .build();
+        // SAFETY: 分配参数来自 buffer 的内存需求，内存类型已校验。
+        let memory = unsafe { self.device.allocate_memory(&allocate_info, None) }
+            .map_err(|error| format!("分配缓冲内存失败: {error}"))?;
+        // SAFETY: buffer 与 memory 由本设备创建，偏移 0 在分配范围内。
+        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|error| format!("绑定缓冲内存失败: {error}"))?;
+        Ok((buffer, memory))
+    }
+
+    fn release_buffer(&self, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+        // SAFETY: buffer/memory 由本设备创建且不再被使用。
+        unsafe {
+            self.device.destroy_buffer(buffer, None);
+            self.device.free_memory(memory, None);
+        }
+    }
+
+    /// 把字节上传到 device-local 缓冲（staging → transfer copy → 同步等待）。
+    fn upload_bytes(
+        &mut self,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        let size = bytes.len() as u64;
+        let (staging, staging_memory) = self.create_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        // SAFETY: staging 内存为 HOST_VISIBLE|HOST_COHERENT，映射大小与 bytes 匹配。
+        unsafe {
+            let mapped = self
+                .device
+                .map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|error| format!("映射 staging 内存失败: {error}"))?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            self.device.unmap_memory(staging_memory);
+        }
+
+        let (buffer, memory) = match self.create_buffer(
+            size,
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                self.release_buffer(staging, staging_memory);
+                return Err(error);
+            }
+        };
+
+        let result = self.copy_buffer_blocking(staging, buffer, size);
+        // staging 只在拷贝期间需要。
+        self.release_buffer(staging, staging_memory);
+        match result {
+            Ok(()) => Ok((buffer, memory)),
+            Err(error) => {
+                self.release_buffer(buffer, memory);
+                Err(error)
+            }
+        }
+    }
+
+    /// 用传输命令缓冲做一次同步缓冲拷贝（提交后等待队列空闲）。
+    fn copy_buffer_blocking(
+        &mut self,
+        source: vk::Buffer,
+        destination: vk::Buffer,
+        size: u64,
+    ) -> Result<(), String> {
+        let begin_info = vk::CommandBufferBeginInfo::builder()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: 传输命令缓冲只在同步上传路径使用，提交后立即等待完成。
+        unsafe {
+            self.device
+                .begin_command_buffer(self.transfer_command_buffer, &begin_info)
+                .map_err(|error| format!("开始缓冲拷贝失败: {error}"))?;
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size,
+            };
+            self.device.cmd_copy_buffer(
+                self.transfer_command_buffer,
+                source,
+                destination,
+                &[region],
+            );
+            // 传输写入 → 顶点/索引读取的可见性依赖；不依赖后续提交顺序自动保证。
+            let no_memory_barriers: [vk::MemoryBarrier; 0] = [];
+            let no_image_barriers: [vk::ImageMemoryBarrier; 0] = [];
+            let buffer_barrier = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::INDEX_READ | vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                )
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(destination)
+                .offset(0)
+                .size(size)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                self.transfer_command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+                vk::DependencyFlags::empty(),
+                &no_memory_barriers,
+                &[buffer_barrier],
+                &no_image_barriers,
+            );
+            self.device
+                .end_command_buffer(self.transfer_command_buffer)
+                .map_err(|error| format!("结束缓冲拷贝失败: {error}"))?;
+            let command_buffers = [self.transfer_command_buffer];
+            let submit = vk::SubmitInfo::builder().command_buffers(&command_buffers);
+            self.device
+                .queue_submit(self.graphics_queue, &[submit], vk::Fence::null())
+                .map_err(|error| format!("提交缓冲拷贝失败: {error}"))?;
+            self.device
+                .queue_wait_idle(self.graphics_queue)
+                .map_err(|error| format!("等待缓冲拷贝完成失败: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn upload_mesh(&mut self, data: &MeshData) -> Result<GpuMesh, String> {
+        let vertex_bytes = vertices_as_bytes(&data.vertices);
+        let index_bytes = indices_as_bytes(&data.indices);
+
+        let (vertex_buffer, vertex_memory) =
+            self.upload_bytes(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (index_buffer, index_memory) =
+            match self.upload_bytes(index_bytes, vk::BufferUsageFlags::INDEX_BUFFER) {
+                Ok(created) => created,
+                Err(error) => {
+                    self.release_buffer(vertex_buffer, vertex_memory);
+                    return Err(error);
+                }
+            };
+
+        Ok(GpuMesh {
+            vertex_buffer,
+            vertex_memory,
+            index_buffer,
+            index_memory,
+            index_count: data.indices.len() as u32,
+        })
     }
 
     fn init_pipeline(&mut self) -> Result<(), String> {
@@ -1118,6 +1396,8 @@ impl Drop for VulkanCore {
             // 管线销毁必须发生在命令缓冲执行完毕之后。
             self.destroy_pipeline();
             self.destroy_depth_resources();
+            self.destroy_all_meshes();
+            self.device.destroy_command_pool(self.transfer_pool, None);
             for view in self.image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }

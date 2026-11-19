@@ -7,7 +7,12 @@
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
 
+mod geometry;
+mod mesh;
 mod vulkan;
+
+pub use geometry::cube;
+pub use mesh::{MeshData, MeshHandle, Vertex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
@@ -32,6 +37,12 @@ pub enum RenderInitError {
     FrameResources(String),
     #[error("Vulkan depth resources initialization failed: {0}")]
     Depth(String),
+    #[error("Vulkan transfer resources initialization failed: {0}")]
+    Transfer(String),
+    #[error("Vulkan mesh upload failed: {0}")]
+    Mesh(String),
+    #[error("renderer is not initialized")]
+    NotInitialized,
     #[error("renderer is already initialized")]
     AlreadyInitialized,
 }
@@ -189,6 +200,22 @@ impl RenderContext {
         self.clear_color = clear_color;
     }
 
+    /// 创建 GPU 网格：需要先完成渲染初始化（headless 下也可上传，只是不会被绘制）。
+    pub fn create_mesh(&mut self, data: &MeshData) -> Result<MeshHandle, RenderInitError> {
+        let backend = self
+            .backend
+            .as_mut()
+            .ok_or(RenderInitError::NotInitialized)?;
+        backend.create_mesh(data).map_err(RenderInitError::Mesh)
+    }
+
+    /// 销毁网格；句柄无效或已销毁时为空操作。
+    pub fn destroy_mesh(&mut self, handle: MeshHandle) {
+        if let Some(backend) = self.backend.as_mut() {
+            let _ = backend.destroy_mesh(handle);
+        }
+    }
+
     /// 完成本帧：清屏 → 提交 → 呈现。headless 或窗口最小化时为空操作。
     pub fn end_frame(&mut self) {
         debug_assert!(self.initialized);
@@ -240,6 +267,43 @@ mod tests {
         let mut context = RenderContext::new(640, 480);
         context.resize(1024, 768);
         assert_eq!(context.size(), (1024, 768));
+    }
+
+    #[test]
+    fn create_mesh_requires_initialized_renderer() {
+        let mut context = RenderContext::new(320, 200);
+        let error = context.create_mesh(&crate::cube()).unwrap_err();
+        assert_eq!(error, RenderInitError::NotInitialized);
+    }
+
+    #[test]
+    fn headless_mesh_upload_roundtrip_when_vulkan_available() {
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+
+        // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let mesh = context.create_mesh(&crate::cube()).expect("上传立方体网格");
+        context.destroy_mesh(mesh);
+
+        // 旧句柄重复销毁不应 panic（世代号不匹配即忽略）。
+        context.destroy_mesh(mesh);
+
+        // 槽位复用后世代号应变化，新旧句柄不相等。
+        let reused = context
+            .create_mesh(&crate::cube())
+            .expect("复用槽位上传网格");
+        assert_ne!(mesh, reused);
+        context.destroy_mesh(reused);
+
+        // 无效数据应返回明确错误而不是上传。
+        assert!(matches!(
+            context.create_mesh(&MeshData::default()),
+            Err(RenderInitError::Mesh(_))
+        ));
     }
 
     #[test]
