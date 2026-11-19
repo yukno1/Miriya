@@ -130,6 +130,13 @@ struct FrameDriver<'a> {
 }
 
 impl WindowApp for FrameDriver<'_> {
+    fn on_window_created(&mut self, window: &mir_window::Window) {
+        if let Err(error) = self.ctx.renderer.init_with_window(window, window) {
+            eprintln!("渲染初始化失败：{error}");
+            self.ctx.request_exit();
+        }
+    }
+
     fn on_event(&mut self, event: WindowEvent) {
         self.ctx.on_window_event(event);
     }
@@ -168,7 +175,6 @@ impl Engine {
             ctx: make_context(&self.config),
             app,
         };
-        driver.ctx.renderer.init();
         driver.app.on_start(&mut driver.ctx);
 
         let window_config = mir_window::WindowConfig {

@@ -11,6 +11,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent as WinitWindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+};
 use winit::window::{Window as WinitWindow, WindowAttributes};
 
 use event::{map_element_state, map_mouse_button, map_physical_key};
@@ -35,6 +38,8 @@ impl Default for WindowConfig {
 
 /// 窗口应用回调：由引擎层实现，接收事件并在每帧被调用。
 pub trait WindowApp {
+    /// 窗口创建完成后调用一次，供渲染层创建 surface/交换链。
+    fn on_window_created(&mut self, _window: &Window) {}
     /// 处理一个窗口事件。
     fn on_event(&mut self, event: WindowEvent);
     /// 每帧更新与渲染（由 `about_to_wait` 驱动）。
@@ -60,11 +65,30 @@ impl Window {
         self.inner.title()
     }
 
-    /// 供渲染后端创建 surface 使用的 raw-window-handle 0.6。
+    /// 供渲染后端创建 surface 使用的 raw-window-handle 0.6（窗口句柄）。
     pub fn raw_handle(&self) -> winit::raw_window_handle::RawWindowHandle {
-        use winit::raw_window_handle::HasWindowHandle;
-        let handle = self.inner.window_handle().expect("窗口应提供 raw handle");
+        let handle = self.window_handle().expect("窗口应提供 raw handle");
         handle.as_raw()
+    }
+
+    /// 供渲染后端创建 surface 使用的 raw-window-handle 0.6（显示句柄）。
+    pub fn raw_display_handle(&self) -> winit::raw_window_handle::RawDisplayHandle {
+        let handle = self
+            .display_handle()
+            .expect("窗口应提供 raw display handle");
+        handle.as_raw()
+    }
+}
+
+impl HasWindowHandle for Window {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        self.inner.window_handle()
+    }
+}
+
+impl HasDisplayHandle for Window {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        self.inner.display_handle()
     }
 }
 
@@ -87,6 +111,13 @@ impl<A: WindowApp> ApplicationHandler for Runner<'_, A> {
             .create_window(attrs)
             .expect("创建窗口失败（当前仅支持 Windows）");
         self.window = Some(Window { inner });
+        if let Some(window) = self.window.as_ref() {
+            self.app.on_window_created(window);
+        }
+        if self.app.should_exit() {
+            self.exit = true;
+            event_loop.exit();
+        }
     }
 
     fn window_event(

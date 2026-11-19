@@ -7,7 +7,7 @@ use std::ffi::{CStr, c_char};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
-use vulkanalia::vk::KhrSurfaceExtensionInstanceCommands;
+use vulkanalia::vk::{KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands};
 use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
 
@@ -15,13 +15,16 @@ use crate::RenderInitError;
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
 
-/// Vulkan 核心对象。按 surface → device → instance 的逆序销毁。
+/// Vulkan 核心对象。按 image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
+    image_views: Vec<vk::ImageView>,
+    swapchain: Option<vk::SwapchainKHR>,
     surface: Option<vk::SurfaceKHR>,
     device: Device,
     instance: Instance,
     // Entry 持有加载器；必须比 Instance / Device 活得更久。
     _entry: Entry,
+    physical_device: vk::PhysicalDevice,
     _graphics_queue: vk::Queue,
     _present_queue: vk::Queue,
     graphics_family: u32,
@@ -30,20 +33,26 @@ pub(super) struct VulkanCore {
     api_version: String,
     surface_format: Option<String>,
     present_mode: Option<String>,
+    format_value: Option<vk::SurfaceFormatKHR>,
+    mode_value: Option<vk::PresentModeKHR>,
 }
 
 impl VulkanCore {
     /// 无窗口（headless）初始化：不创建 surface，不启用交换链扩展。
     pub(super) fn new_headless() -> Result<Self, RenderInitError> {
-        Self::create(None, None)
+        Self::create(None, None, 0, 0)
     }
 
-    /// 带窗口初始化：创建 surface，并要求物理设备支持呈现。
+    /// 带窗口初始化：创建 surface 与交换链，并要求物理设备支持呈现。
     pub(super) fn with_surface(
         display: &dyn HasDisplayHandle,
         window: &dyn HasWindowHandle,
+        width: u32,
+        height: u32,
     ) -> Result<Self, RenderInitError> {
-        Self::create(Some(display), Some(window))
+        let mut core = Self::create(Some(display), Some(window), width, height)?;
+        core.create_swapchain(width, height)?;
+        Ok(core)
     }
 
     pub(super) fn device_name(&self) -> &str {
@@ -70,9 +79,15 @@ impl VulkanCore {
         self.present_mode.as_deref()
     }
 
+    pub(super) fn swapchain_image_count(&self) -> u32 {
+        self.image_views.len() as u32
+    }
+
     fn create(
         display: Option<&dyn HasDisplayHandle>,
         window: Option<&dyn HasWindowHandle>,
+        _width: u32,
+        _height: u32,
     ) -> Result<Self, RenderInitError> {
         // SAFETY: 从系统路径加载标准 Vulkan loader；返回的 Entry 在本函数返回后由 VulkanCore 持有。
         let loader = unsafe { LibloadingLoader::new(LIBRARY) }
@@ -195,7 +210,7 @@ impl VulkanCore {
         let graphics_queue = unsafe { device.get_device_queue(graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(present_family, 0) };
 
-        let (surface_format, present_mode) = match surface {
+        let (surface_format, present_mode, format_value, mode_value) = match surface {
             Some(surface) => {
                 // SAFETY: physical_device 与 surface 均有效且仍存活。
                 let formats = unsafe {
@@ -207,19 +222,38 @@ impl VulkanCore {
                     instance.get_physical_device_surface_present_modes_khr(physical_device, surface)
                 }
                 .map_err(|error| RenderInitError::Surface(error.to_string()))?;
+                let format = formats.first().copied().ok_or_else(|| {
+                    RenderInitError::Surface("no surface format available".into())
+                })?;
+                let mode = modes
+                    .iter()
+                    .copied()
+                    .find(|mode| *mode == vk::PresentModeKHR::IMMEDIATE)
+                    .or_else(|| {
+                        modes
+                            .iter()
+                            .copied()
+                            .find(|mode| *mode == vk::PresentModeKHR::FIFO)
+                    })
+                    .ok_or_else(|| RenderInitError::Surface("no present mode available".into()))?;
                 (
-                    formats.first().map(|entry| format!("{:?}", entry.format)),
-                    modes.first().map(|mode| format!("{mode:?}")),
+                    Some(format!("{:?}", format.format)),
+                    Some(format!("{mode:?}")),
+                    Some(format),
+                    Some(mode),
                 )
             }
-            None => (None, None),
+            None => (None, None, None, None),
         };
 
         Ok(Self {
+            image_views: Vec::new(),
+            swapchain: None,
             surface,
             device,
             instance,
             _entry: entry,
+            physical_device,
             _graphics_queue: graphics_queue,
             _present_queue: present_queue,
             graphics_family,
@@ -228,14 +262,114 @@ impl VulkanCore {
             api_version: format_version(api_version),
             surface_format,
             present_mode,
+            format_value,
+            mode_value,
         })
+    }
+
+    fn create_swapchain(&mut self, width: u32, height: u32) -> Result<(), RenderInitError> {
+        let surface = self.surface.ok_or(RenderInitError::NoDevice)?;
+        let format = self.format_value.ok_or(RenderInitError::NoDevice)?;
+        let mode = self.mode_value.ok_or(RenderInitError::NoDevice)?;
+
+        // SAFETY: physical_device 与 surface 仍有效且未被销毁。
+        let capabilities = unsafe {
+            self.instance
+                .get_physical_device_surface_capabilities_khr(self.physical_device, surface)
+        }
+        .map_err(|error| RenderInitError::Swapchain(error.to_string()))?;
+
+        let mut image_count = capabilities.min_image_count + 1;
+        if capabilities.max_image_count > 0 && image_count > capabilities.max_image_count {
+            image_count = capabilities.max_image_count;
+        }
+        let extent = if capabilities.current_extent.width == u32::MAX {
+            vk::Extent2D {
+                width: width
+                    .max(capabilities.min_image_extent.width)
+                    .min(capabilities.max_image_extent.width),
+                height: height
+                    .max(capabilities.min_image_extent.height)
+                    .min(capabilities.max_image_extent.height),
+            }
+        } else {
+            capabilities.current_extent
+        };
+
+        let mut families = vec![self.graphics_family];
+        if self.present_family != self.graphics_family {
+            families.push(self.present_family);
+        }
+        let sharing_mode = if families.len() > 1 {
+            vk::SharingMode::CONCURRENT
+        } else {
+            vk::SharingMode::EXCLUSIVE
+        };
+        let composite_alpha = if capabilities
+            .supported_composite_alpha
+            .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        {
+            vk::CompositeAlphaFlagsKHR::OPAQUE
+        } else {
+            vk::CompositeAlphaFlagsKHR::INHERIT
+        };
+        let info = vk::SwapchainCreateInfoKHR::builder()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(format.format)
+            .image_color_space(format.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(sharing_mode)
+            .queue_family_indices(&families)
+            .pre_transform(capabilities.current_transform)
+            .composite_alpha(composite_alpha)
+            .present_mode(mode)
+            .clipped(true);
+        // SAFETY: surface/device/format/mode 均来自本对象持有的有效 Vulkan 资源。
+        let swapchain = unsafe { self.device.create_swapchain_khr(&info, None) }
+            .map_err(|error| RenderInitError::Swapchain(error.to_string()))?;
+        // SAFETY: swapchain 刚刚创建成功且仍有效。
+        let images = unsafe { self.device.get_swapchain_images_khr(swapchain) }
+            .map_err(|error| RenderInitError::Swapchain(error.to_string()))?;
+
+        let mut views = Vec::with_capacity(images.len());
+        for image in images {
+            let subresource = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build();
+            let view_info = vk::ImageViewCreateInfo::builder()
+                .image(image)
+                .view_type(vk::ImageViewType::_2D)
+                .format(format.format)
+                .components(vk::ComponentMapping::builder().build())
+                .subresource_range(subresource);
+            // SAFETY: image 来自本 swapchain，格式与子资源范围匹配。
+            let view = unsafe { self.device.create_image_view(&view_info, None) }
+                .map_err(|error| RenderInitError::Swapchain(error.to_string()))?;
+            views.push(view);
+        }
+        self.swapchain = Some(swapchain);
+        self.image_views = views;
+        Ok(())
     }
 }
 
 impl Drop for VulkanCore {
     fn drop(&mut self) {
-        // SAFETY: 本对象仍持有有效的 Vulkan 句柄；按 surface → device → instance 逆序释放。
+        // SAFETY: 本对象仍持有有效的 Vulkan 句柄；按 image views → swapchain → surface → device → instance 逆序释放。
         unsafe {
+            for view in self.image_views.drain(..) {
+                self.device.destroy_image_view(view, None);
+            }
+            if let Some(swapchain) = self.swapchain.take() {
+                self.device.destroy_swapchain_khr(swapchain, None);
+            }
             if let Some(surface) = self.surface.take() {
                 self.instance.destroy_surface_khr(surface, None);
             }

@@ -468,8 +468,8 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | `vulkanalia` 实例/物理设备/逻辑设备/图形与呈现队列、surface 与交换链前置查询；无实际绘制 | 🟡 原型 | 交换链/RenderGraph/绘制与验证层（M2） |
-| `mir-window` | winit 0.30 窗口与事件循环，`raw_handle()` 暴露窗口句柄 | 🟡 原型 | 窗口句柄接入渲染层、DPI 缩放（M1/M2） |
+| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链与图像视图；无实际绘制/present | 🟡 原型 | RenderGraph/绘制/present、交换链重建与验证层（M2） |
+| `mir-window` | winit 0.30 窗口与事件循环，实现 `HasWindowHandle`/`HasDisplayHandle`，窗口创建回调 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M1/M2） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
 | `mir-log` | 全局 logger、五级宏、控制台输出、含单元测试，纯 std | ✅ 可用 | `tracing` 桥接、文件/异步 writer（M1） |
@@ -1021,14 +1021,19 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] **M2 第一阶段**：`vulkanalia` 已进入 `mir-render`——Vulkan 1.3 实例、物理设备筛选、逻辑设备与
       图形/呈现队列、可选 surface 与交换链前置查询（格式/呈现模式）；公共 API 不含 Vulkan 类型，
       headless 初始化在 CI/无 GPU 环境下降级而非 panic。`RenderContext` 既有签名保持不变。
+- [x] **M2 第二阶段**：`mir-window::Window` 实现 `HasWindowHandle`/`HasDisplayHandle`，新增
+      `WindowApp::on_window_created` 回调；`mir-core` 在窗口创建后用真实句柄初始化渲染；
+      `mir-render` 创建交换链与图像视图（优先 IMMEDIATE，回退 FIFO；OPAQUE 合成），
+      并按 image views → swapchain → surface → device → instance 逆序释放。窗口冒烟 `--frames 60` 通过。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已能创建 Vulkan 实例/设备/队列，但 `begin_frame`/`end_frame` 仍为空操作；尚未创建
-   Vulkan swapchain 与 RenderGraph，验证层也未启用（M2 剩余范围）。窗口句柄尚未从 `mir-window` 传入渲染层。
+3. `mir-render` 已能创建 Vulkan 实例/设备/队列、surface 与交换链，但 `begin_frame`/`end_frame`
+   仍是空操作：尚未录制命令缓冲、acquire/present 与 RenderGraph；窗口缩放也尚未重建交换链，
+   验证层未启用（M2 剩余范围）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。

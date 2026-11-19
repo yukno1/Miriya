@@ -1,8 +1,8 @@
 //! 渲染子系统：Vulkan 1.3 唯一后端（`vulkanalia`）。
 //!
 //! 公共 API 不暴露任何 Vulkan 类型；`VulkanCore` 完全封装在 crate 内部
-//! （ADR 0005 / README §5.1 规则 2）。当前处于 M2 第一阶段：已接入实例、
-//! 物理设备、逻辑设备与队列选择；RenderGraph / 交换链 / 绘制仍待后续里程碑。
+//! （ADR 0005 / README §5.1 规则 2）。当前已接入实例、物理设备、逻辑设备、
+//! 队列选择、surface 与交换链；RenderGraph / 绘制 / present 仍待后续里程碑。
 //!
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
@@ -26,6 +26,8 @@ pub enum RenderInitError {
     Device(String),
     #[error("Vulkan surface creation failed: {0}")]
     Surface(String),
+    #[error("Vulkan swapchain creation failed: {0}")]
+    Swapchain(String),
     #[error("renderer is already initialized")]
     AlreadyInitialized,
 }
@@ -44,6 +46,7 @@ pub enum RendererStatus {
         present_family: u32,
         surface_format: Option<String>,
         present_mode: Option<String>,
+        swapchain_image_count: u32,
     },
     /// 初始化失败，附可读原因。
     Failed(String),
@@ -89,6 +92,7 @@ impl RenderContext {
                     present_family: backend.queue_families().1,
                     surface_format: backend.surface_format().map(str::to_string),
                     present_mode: backend.present_mode().map(str::to_string),
+                    swapchain_image_count: backend.swapchain_image_count(),
                 };
                 self.backend = Some(backend);
             }
@@ -111,19 +115,28 @@ impl RenderContext {
         if self.initialized {
             return Err(RenderInitError::AlreadyInitialized);
         }
-        let backend = VulkanCore::with_surface(display, window)?;
-        self.status = RendererStatus::Vulkan {
-            device_name: backend.device_name().to_string(),
-            api_version: backend.api_version().to_string(),
-            has_surface: backend.has_surface(),
-            graphics_family: backend.queue_families().0,
-            present_family: backend.queue_families().1,
-            surface_format: backend.surface_format().map(str::to_string),
-            present_mode: backend.present_mode().map(str::to_string),
-        };
-        self.backend = Some(backend);
-        self.initialized = true;
-        Ok(())
+        match VulkanCore::with_surface(display, window, self.width, self.height) {
+            Ok(backend) => {
+                self.status = RendererStatus::Vulkan {
+                    device_name: backend.device_name().to_string(),
+                    api_version: backend.api_version().to_string(),
+                    has_surface: backend.has_surface(),
+                    graphics_family: backend.queue_families().0,
+                    present_family: backend.queue_families().1,
+                    surface_format: backend.surface_format().map(str::to_string),
+                    present_mode: backend.present_mode().map(str::to_string),
+                    swapchain_image_count: backend.swapchain_image_count(),
+                };
+                self.backend = Some(backend);
+                self.initialized = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.status = RendererStatus::Failed(error.to_string());
+                self.initialized = true;
+                Err(error)
+            }
+        }
     }
 
     /// 是否已完成初始化（含降级为占位模式的情况）。
