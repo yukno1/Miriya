@@ -49,6 +49,8 @@ pub(super) struct VulkanCore {
     frame: Option<FrameResources>,
     depth: Option<DepthResources>,
     depth_format: Option<vk::Format>,
+    /// 交换链被 acquire/present 报告为失效，需在下一帧重建。
+    swapchain_outdated: bool,
     image_views: Vec<vk::ImageView>,
     /// 交换链图像句柄，用于每帧的 layout 转换（由交换链持有，不单独销毁）。
     swapchain_images: Vec<vk::Image>,
@@ -323,6 +325,7 @@ impl VulkanCore {
             frame: None,
             depth: None,
             depth_format: None,
+            swapchain_outdated: false,
             image_views: Vec::new(),
             swapchain_images: Vec::new(),
             swapchain: None,
@@ -439,6 +442,7 @@ impl VulkanCore {
         self.image_views = views;
         self.swapchain_images = images;
         self.extent = extent;
+        self.swapchain_outdated = false;
         Ok(())
     }
 
@@ -836,12 +840,35 @@ impl VulkanCore {
         }
     }
 
+    /// 当前交换链尺寸是否与应用层已知的窗口尺寸不一致。
+    fn target_differs(&self, width: u32, height: u32) -> bool {
+        self.extent.width != width || self.extent.height != height
+    }
+
     /// 录制一帧：清屏 → 绘制三角形 → 提交 → 呈现。无交换链时为空操作（headless）。
-    pub(super) fn render_frame(&mut self, clear_color: [f32; 4]) -> Result<(), String> {
+    ///
+    /// 交换链失效（`OUT_OF_DATE`）不视为帧错误：标记后本帧跳过，下一帧开头按当前窗口尺寸重建。
+    /// `width` / `height` 是应用层已知的窗口尺寸，用于重建时取最新目标大小。
+    pub(super) fn render_frame(
+        &mut self,
+        clear_color: [f32; 4],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if self.surface.is_none() {
+            return Ok(());
+        }
+        if self.swapchain_outdated {
+            self.swapchain_outdated = false;
+            self.recreate_swapchain(width.max(1), height.max(1))?;
+        }
+
         let swapchain = match self.swapchain {
             Some(swapchain) => swapchain,
             None => return Ok(()),
         };
+        // 交换链尺寸与窗口尺寸是否不一致；先算好，避免持有 `frame` 可变借用时再借 `self`。
+        let target_differs = self.target_differs(width, height);
         let frame = match self.frame.as_mut() {
             Some(frame) => frame,
             None => return Ok(()),
@@ -852,18 +879,26 @@ impl VulkanCore {
             self.device
                 .wait_for_fences(&[frame.fence], true, u64::MAX)
                 .map_err(|error| format!("等待 GPU 完成失败: {error}"))?;
+            let (index, suboptimal) = match self.device.acquire_next_image_khr(
+                swapchain,
+                u64::MAX,
+                frame.image_available,
+                vk::Fence::null(),
+            ) {
+                Ok(acquired) => acquired,
+                Err(vk::ErrorCode::OUT_OF_DATE_KHR) => {
+                    // 提前返回时不能重置 fence，否则下一帧会永久等待一个未信号的 fence。
+                    self.swapchain_outdated = true;
+                    return Ok(());
+                }
+                Err(error) => return Err(format!("获取交换链图像失败: {error}")),
+            };
             self.device
                 .reset_fences(&[frame.fence])
                 .map_err(|error| format!("重置 fence 失败: {error}"))?;
-            let (index, _) = self
-                .device
-                .acquire_next_image_khr(
-                    swapchain,
-                    u64::MAX,
-                    frame.image_available,
-                    vk::Fence::null(),
-                )
-                .map_err(|error| format!("获取交换链图像失败: {error}"))?;
+            if suboptimal == vk::SuccessCode::SUBOPTIMAL_KHR && target_differs {
+                self.swapchain_outdated = true;
+            }
 
             let begin_info = vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1016,9 +1051,18 @@ impl VulkanCore {
                 .wait_semaphores(&present_wait)
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
-            self.device
-                .queue_present_khr(self.present_queue, &present)
-                .map_err(|error| format!("呈现失败: {error}"))?;
+            match self.device.queue_present_khr(self.present_queue, &present) {
+                Ok(suboptimal) => {
+                    if suboptimal == vk::SuccessCode::SUBOPTIMAL_KHR && target_differs {
+                        self.swapchain_outdated = true;
+                    }
+                }
+                Err(vk::ErrorCode::OUT_OF_DATE_KHR) => {
+                    // 呈现失败但提交已完成；下一帧重建交换链后重新呈现新帧。
+                    self.swapchain_outdated = true;
+                }
+                Err(error) => return Err(format!("呈现失败: {error}")),
+            }
         }
         Ok(())
     }

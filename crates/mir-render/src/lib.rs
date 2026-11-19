@@ -168,9 +168,14 @@ impl RenderContext {
     }
 
     /// 窗口缩放时更新渲染目标尺寸，并重建交换链。
+    ///
+    /// 最小化（宽或高为 0）时只记录尺寸、保留旧交换链，恢复为非零尺寸后再重建。
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+        if width == 0 || height == 0 {
+            return;
+        }
         if let Some(backend) = self.backend.as_mut()
             && let Err(error) = backend.recreate_swapchain(width, height)
         {
@@ -184,11 +189,15 @@ impl RenderContext {
         self.clear_color = clear_color;
     }
 
-    /// 完成本帧：清屏 → 提交 → 呈现。headless 下为空操作。
+    /// 完成本帧：清屏 → 提交 → 呈现。headless 或窗口最小化时为空操作。
     pub fn end_frame(&mut self) {
         debug_assert!(self.initialized);
+        // 最小化时窗口尺寸为 0：跳过 acquire/present，避免查询/提交到无效交换链。
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
         if let Some(backend) = self.backend.as_mut() {
-            if let Err(error) = backend.render_frame(self.clear_color) {
+            if let Err(error) = backend.render_frame(self.clear_color, self.width, self.height) {
                 self.frame_error = Some(error);
             } else {
                 self.frame_error = None;
@@ -231,5 +240,25 @@ mod tests {
         let mut context = RenderContext::new(640, 480);
         context.resize(1024, 768);
         assert_eq!(context.size(), (1024, 768));
+    }
+
+    #[test]
+    fn minimized_window_skips_frame() {
+        let mut context = RenderContext::new(640, 480);
+        context.init();
+
+        // 最小化：尺寸归零，跳帧，不应产生错误。
+        context.resize(0, 0);
+        assert_eq!(context.size(), (0, 0));
+        context.begin_frame([0.0, 0.0, 0.0, 1.0]);
+        context.end_frame();
+        assert!(context.frame_error().is_none());
+
+        // 恢复：重新按新尺寸重建并继续出帧。
+        context.resize(800, 600);
+        assert_eq!(context.size(), (800, 600));
+        context.begin_frame([0.1, 0.1, 0.1, 1.0]);
+        context.end_frame();
+        assert!(context.frame_error().is_none());
     }
 }
