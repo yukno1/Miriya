@@ -1,7 +1,53 @@
-//! 渲染子系统。
+//! 渲染子系统：Vulkan 1.3 唯一后端（`vulkanalia`）。
 //!
-//! 目前是占位实现；接入 vulkanalia 时在这里定义 `RenderBackend`
-//! trait，把具体图形 API 隔离在引擎内部。
+//! 公共 API 不暴露任何 Vulkan 类型；`VulkanCore` 完全封装在 crate 内部
+//! （ADR 0005 / README §5.1 规则 2）。当前处于 M2 第一阶段：已接入实例、
+//! 物理设备、逻辑设备与队列选择；RenderGraph / 交换链 / 绘制仍待后续里程碑。
+//!
+//! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
+//! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
+
+mod vulkan;
+
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use thiserror::Error;
+use vulkan::VulkanCore;
+
+/// 渲染初始化失败。仅用于诊断；`RenderContext::init` 会记录失败并继续以占位模式运行。
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum RenderInitError {
+    #[error("Vulkan loader unavailable: {0}")]
+    Loader(String),
+    #[error("Vulkan instance creation failed: {0}")]
+    Instance(String),
+    #[error("no suitable Vulkan 1.3 physical device")]
+    NoDevice,
+    #[error("Vulkan logical device creation failed: {0}")]
+    Device(String),
+    #[error("Vulkan surface creation failed: {0}")]
+    Surface(String),
+    #[error("renderer is already initialized")]
+    AlreadyInitialized,
+}
+
+/// 渲染后端当前状态（UI/应用层可显示，不含 Vulkan 类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RendererStatus {
+    /// 尚未调用初始化。
+    Uninitialized,
+    /// Vulkan 已就绪。
+    Vulkan {
+        device_name: String,
+        api_version: String,
+        has_surface: bool,
+        graphics_family: u32,
+        present_family: u32,
+        surface_format: Option<String>,
+        present_mode: Option<String>,
+    },
+    /// 初始化失败，附可读原因。
+    Failed(String),
+}
 
 /// 渲染上下文：持有后端状态，由主循环持有。
 pub struct RenderContext {
@@ -9,25 +55,85 @@ pub struct RenderContext {
     initialized: bool,
     width: u32,
     height: u32,
+    backend: Option<VulkanCore>,
+    status: RendererStatus,
 }
 
 impl RenderContext {
+    /// 创建渲染上下文。
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             exit_requested: false,
             initialized: false,
             width,
             height,
+            backend: None,
+            status: RendererStatus::Uninitialized,
         }
     }
 
-    /// 初始化渲染后端（创建窗口、图形设备等）。
+    /// 以 headless 方式初始化：尝试创建 Vulkan 实例与逻辑设备，但不创建 surface。
+    ///
+    /// 失败时记录 [`RendererStatus::Failed`] 而不 panic，保证 CI/无 GPU 环境可运行。
     pub fn init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        match VulkanCore::new_headless() {
+            Ok(backend) => {
+                self.status = RendererStatus::Vulkan {
+                    device_name: backend.device_name().to_string(),
+                    api_version: backend.api_version().to_string(),
+                    has_surface: backend.has_surface(),
+                    graphics_family: backend.queue_families().0,
+                    present_family: backend.queue_families().1,
+                    surface_format: backend.surface_format().map(str::to_string),
+                    present_mode: backend.present_mode().map(str::to_string),
+                };
+                self.backend = Some(backend);
+            }
+            Err(error) => {
+                self.status = RendererStatus::Failed(error.to_string());
+            }
+        }
         self.initialized = true;
     }
 
+    /// 使用窗口初始化：创建 Vulkan surface，并要求设备支持呈现。
+    ///
+    /// `display` / `window` 由 `mir-window` 的 raw-window-handle 提供；
+    /// 窗口必须比 [`RenderContext`] 活得更久（surface 在 Drop 时才销毁）。
+    pub fn init_with_window(
+        &mut self,
+        display: &dyn HasDisplayHandle,
+        window: &dyn HasWindowHandle,
+    ) -> Result<(), RenderInitError> {
+        if self.initialized {
+            return Err(RenderInitError::AlreadyInitialized);
+        }
+        let backend = VulkanCore::with_surface(display, window)?;
+        self.status = RendererStatus::Vulkan {
+            device_name: backend.device_name().to_string(),
+            api_version: backend.api_version().to_string(),
+            has_surface: backend.has_surface(),
+            graphics_family: backend.queue_families().0,
+            present_family: backend.queue_families().1,
+            surface_format: backend.surface_format().map(str::to_string),
+            present_mode: backend.present_mode().map(str::to_string),
+        };
+        self.backend = Some(backend);
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// 是否已完成初始化（含降级为占位模式的情况）。
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// 当前后端状态。
+    pub fn status(&self) -> &RendererStatus {
+        &self.status
     }
 
     /// 当前渲染目标尺寸（随窗口缩放更新）。
@@ -41,16 +147,51 @@ impl RenderContext {
         self.height = height;
     }
 
-    /// 清屏并开始本帧渲染。
+    /// 清屏并开始本帧渲染（绘制逻辑待 M2/M5）。
     pub fn begin_frame(&mut self, clear_color: [f32; 4]) {
         debug_assert!(self.initialized);
-        // TODO: 接入 vulkanalia 后在这里执行 pass 开始逻辑
         let _ = clear_color;
     }
 
-    /// 结束本帧渲染并呈现。
+    /// 结束本帧渲染并呈现（提交/交换链 present 待 M2）。
     pub fn end_frame(&mut self) {
         debug_assert!(self.initialized);
-        // TODO: 提交命令缓冲、swap chain present
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_context_is_uninitialized() {
+        let context = RenderContext::new(1280, 720);
+        assert!(!context.is_initialized());
+        assert_eq!(context.status(), &RendererStatus::Uninitialized);
+        assert_eq!(context.size(), (1280, 720));
+        assert!(!context.exit_requested);
+    }
+
+    #[test]
+    fn headless_init_never_panics() {
+        let mut context = RenderContext::new(640, 480);
+        context.init();
+        assert!(context.is_initialized());
+        assert!(matches!(
+            context.status(),
+            RendererStatus::Vulkan {
+                has_surface: false,
+                ..
+            } | RendererStatus::Failed(_)
+        ));
+        context.begin_frame([0.0, 0.0, 0.0, 1.0]);
+        context.end_frame();
+    }
+
+    #[test]
+    fn resize_updates_render_target() {
+        let mut context = RenderContext::new(640, 480);
+        context.resize(1024, 768);
+        assert_eq!(context.size(), (1024, 768));
     }
 }

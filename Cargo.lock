@@ -766,6 +766,11 @@ version = "0.1.0"
 [[package]]
 name = "mir-render"
 version = "0.1.0"
+dependencies = [
+ "raw-window-handle",
+ "thiserror 2.0.21",
+ "vulkanalia",
+]
 
 [[package]]
 name = "mir-scene"

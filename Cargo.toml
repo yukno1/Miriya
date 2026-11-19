@@ -14,3 +14,5 @@ edition = "2024"
 [workspace.dependencies]
 miriya-engine = { path = "crates/miriya-engine" }
 thiserror = "2"
+vulkanalia = { version = "0.35", features = ["libloading", "window"] }
+raw-window-handle = "0.6"

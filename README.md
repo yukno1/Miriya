@@ -370,8 +370,8 @@ miriya-editor（组合根，选择 UI 后端）
 ### 6.1 当前结构（M0 骨架已落地）
 
 workspace 已按目标结构拍平，`cargo metadata` 验证为 **41 个成员**（37 个 crates + 4 个 tools）；
-其中 11 个保留现有实现（门面、示例、9 个引擎子 crate），新增 `mir-vulkan-probe` PoC 工具，
-其余 29 个为仅含模块文档的结构占位。
+其中 13 个已有实现（门面、示例、11 个引擎子 crate，含 `mir-physics` 与 `mir-editor-core` 的契约骨架），
+新增 `mir-vulkan-probe` PoC 工具，其余 27 个为仅含模块文档的结构占位。
 
 ```text
 Miriya/
@@ -468,13 +468,15 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | 占位：`init`/`begin_frame`/`end_frame` 无实际 GPU 工作 | ⬜ 占位 | `vulkanalia` 实例/设备/交换链/RenderGraph（M2） |
-| `mir-window` | 仅记录 title/size，无事件循环 | ⬜ 占位 | winit 窗口与事件翻译（M1） |
+| `mir-render` | `vulkanalia` 实例/物理设备/逻辑设备/图形与呈现队列、surface 与交换链前置查询；无实际绘制 | 🟡 原型 | 交换链/RenderGraph/绘制与验证层（M2） |
+| `mir-window` | winit 0.30 窗口与事件循环，`raw_handle()` 暴露窗口句柄 | 🟡 原型 | 窗口句柄接入渲染层、DPI 缩放（M1/M2） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
 | `mir-log` | 全局 logger、五级宏、控制台输出、含单元测试，纯 std | ✅ 可用 | `tracing` 桥接、文件/异步 writer（M1） |
+| `mir-physics` | `PhysicsBackend` 契约、世代句柄、`FixedStep`、查询/接触事件/调试数据、`NullPhysicsBackend`、可复用契约测试；无求解器 | 🟡 契约 | 引擎侧胶水与外部后端接入（M6） |
+| `mir-editor-core` | UI 无关的文档/选择/类型化命令与撤销栈/Inspector 字段描述/视口数学/PIE 状态机，headless 测试 | 🟡 契约 | 完整编辑器核心与 UI 后端 spike（M12） |
 
-> 现状细节与已知问题见 §14。除上表 9 个原型子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
+> 现状细节与已知问题见 §14。除上表 11 个已有内容的子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
 > 仓库不包含任何物理求解器实现。
 
 ---
@@ -993,7 +995,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 ### 14.1 已完成
 
 - [x] workspace 已按目标结构拍平并收敛：**41 个成员**（37 个 crates + 4 个 tools，含 `mir-vulkan-probe` PoC）；
-  9 个引擎子 crate 保留原型，29 个空壳 crate 仅含模块文档。
+  11 个引擎子 crate 已有实现，27 个空壳 crate 仅含模块文档。
 - [x] `rust-toolchain.toml`、`.editorconfig`、`managed/`、`docs/`、`assets/`、`config/`、`shaders/`、`tests/` 骨架。
 - [x] 基础主循环（`AppState` 回调、帧率限制、时间推进）。
 - [x] 数学 newtype 封装（Vec/Mat/Quat）与单元测试。
@@ -1011,21 +1013,31 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] 帧统计 `FrameStats`（帧数、平滑 FPS、帧耗时）接入 `EngineContext`；`Engine::run_headless` 支持
   无窗口跑帧，新增 `headless_1000_frames` 测试。
 - [x] M0 遗留：`vulkanalia` PoC 全链路实测通过（RFC 0001），首批 10 篇 ADR 落盘 `docs/adr/`。
+- [x] **M0 契约起草**：`mir-physics` 落地 `PhysicsBackend` 契约、`BodyId`/`ColliderId` 世代句柄、
+      `FixedStep`、射线/扫掠/重叠/接触事件/调试绘制数据、`NullPhysicsBackend` 与可复用的
+      `assert_backend_contract`；`mir-editor-core` 落地 UI 无关的关卡文档/选择/类型化命令与撤销栈/
+      Inspector 字段描述/视口与 Gizmo 数学/PIE 状态机，并附 headless 测试。两 crate 均 `forbid(unsafe_code)`，
+      不依赖 winit/Vulkan/UI 框架。
+- [x] **M2 第一阶段**：`vulkanalia` 已进入 `mir-render`——Vulkan 1.3 实例、物理设备筛选、逻辑设备与
+      图形/呈现队列、可选 surface 与交换链前置查询（格式/呈现模式）；公共 API 不含 Vulkan 类型，
+      headless 初始化在 CI/无 GPU 环境下降级而非 panic。`RenderContext` 既有签名保持不变。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
-1. 29 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 9 个原型子系统，新模块尚未接入 facade。
+1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 仍是占位实现：`init`/`begin_frame`/`end_frame` 无实际 GPU 工作；窗口尺寸变化已记录，
-   但未创建 Vulkan swapchain（M2 范围）。
+3. `mir-render` 已能创建 Vulkan 实例/设备/队列，但 `begin_frame`/`end_frame` 仍为空操作；尚未创建
+   Vulkan swapchain 与 RenderGraph，验证层也未启用（M2 剩余范围）。窗口句柄尚未从 `mir-window` 传入渲染层。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
-5. Git 仓库已初始化但尚无提交。
+5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
-7. `vulkanalia` 已在 PoC 工具中验证（RFC 0001），但尚未引入 `mir-render`；.NET 10 宿主未接入；
-   `mir-script`、`mir-bindgen`、`managed/` 仍为空壳，需 M2 与 M8 落地。
-8. 当前没有物理实现（这是新约束）：`mir-physics` 仅为接口空壳，v0.4 起需要接入外部自研后端。
-9. 编辑器 UI 后端尚未选定：`mir-editor-core` 等已创建空壳，GPUI/egui 需在 M12 前完成 spike 与 ADR-0009。
+7. `vulkanalia` 已从 PoC（RFC 0001）引入 `mir-render`；.NET 10 宿主仍未接入；
+   `mir-script`、`mir-bindgen`、`managed/` 仍为空壳，需 M8 落地。
+8. 当前没有物理求解器（这是新约束）：`mir-physics` 已提供可编译的契约骨架与 `NullPhysicsBackend`，
+   但求解器仍须由外部自研后端提供；引擎侧固定步/句柄表/坐标转换胶水留待 M6，v0.4 起需接入外部后端。
+9. 编辑器 UI 后端尚未选定：`mir-editor-core` 已有 UI 无关契约骨架（headless 测试通过），
+   `mir-editor-ui`/`mir-editor-gpui`/`mir-editor-egui` 仍为空壳；GPUI/egui 需在 M12 前完成 spike 与 ADR-0009。
 
 ### 14.3 快速开始
 
@@ -1061,7 +1073,9 @@ cargo run -p mir-vulkan-probe
 - [x] `vulkanalia` 最小 PoC（`tools/mir-vulkan-probe`）：实例/物理设备/逻辑设备/surface/交换链前置查询全链路
       本机实测通过（Loader 1.4.341、Intel Iris Xe、Vulkan 1.3、B8G8R8A8_UNORM/IMMEDIATE），
       风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 10 hostfxr 托管 PoC 属 M8 前置。
-- [ ] 起草 `PhysicsBackend` 契约与 `mir-editor-core` 边界（UI 无关），供 M6/M12 使用。
+- [x] 起草 `PhysicsBackend` 契约与 `mir-editor-core` 边界（UI 无关），供 M6/M12 使用：
+      两 crate 的骨架已落地并通过 `cargo test --workspace` 与 Clippy `-D warnings`；
+      `thiserror = "2"` 已纳入 `[workspace.dependencies]`。
 - [x] 建立 `docs/adr/` 目录。
 - [x] 撰写首批 ADR 0001–0010（布局、ECS、坐标系、渲染管线、Vulkan 单后端、C# 脚本运行时、
       Windows-only/Linux 接口、物理后端接口、编辑器 UI 后端选型、Rust-first API/1:1 边界）；
@@ -1130,5 +1144,5 @@ cargo run -p mir-vulkan-probe
 
 ---
 
-> **文档维护**：Miriya 团队 · 最后更新 2026-11-18
+> **文档维护**：Miriya 团队 · 最后更新 2026-11-19
 > 本文件是**规划**，不代表上述能力已经完成；进度以 §14 为准，变更以 ADR 为准。

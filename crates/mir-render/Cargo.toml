@@ -2,6 +2,9 @@
 name = "mir-render"
 version.workspace = true
 edition.workspace = true
-description = "Miriya render abstraction"
+description = "Miriya renderer (Vulkan 1.3 / vulkanalia)"
 
 [dependencies]
+raw-window-handle.workspace = true
+thiserror.workspace = true
+vulkanalia.workspace = true
