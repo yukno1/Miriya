@@ -1,7 +1,7 @@
 # ADR 0004：渲染管线与 RenderGraph
 
 - 日期：2026-11-18
-- 状态：Accepted
+- 状态：Accepted（着色器语言部分由 ADR 0011 取代，其余决策仍然有效）
 - 关联：README §9.6、RFC 0001
 
 ## 背景
@@ -18,7 +18,7 @@
 3. **数据解耦**：`extract` 阶段把 ECS 转成纯帧数据（相机、光源、实例、材质），`mir-render` 不访问 ECS、不依赖 `mir-scene`。
 4. **Vulkan 1.3 特性**：dynamic rendering、synchronization2、timeline semaphore、descriptor indexing；
    自研显存子分配器（块/池/延迟回收），不引入 `ash`/VMA 之外的第三方 RHI。
-5. **着色器**：GLSL 4.60（公共 chunk + 自研 include）经 `shaderc` 编译为 SPIR-V；
+5. **着色器**：Slang（公共 module + `import`）经 `slangc` 直接编译为 SPIR-V，阶段入口统一为 `main`；
    `spirv-reflect` 生成绑定；`spirv-val` + validation layer 把关；离线缓存以管线哈希为键，开发模式热重载。
 6. **帧结构**：2–3 帧在飞行、环形暂存缓冲；交换链重建/设备丢失有恢复路径；调试版启用 Khronos validation layer，
    发布版持久化 pipeline cache。
@@ -29,7 +29,7 @@
 - **Deferred / 传统 Forward**：前者对透明与 MSAA 处理复杂，后者灯光扩展性差；Clustered Forward+ 兼顾二者。
 - **手动管理 barrier / 无 RenderGraph**：短期直接，长期资源转换易出错，无法支撑多 pass 后处理。
 - **引入第三方 RenderGraph 库**：与自研渲染节奏不合，且增加公共 API 面积。
-- **SPIR-V 直接手写 / 用其他着色语言**：GLSL 生态与工具链成熟，团队熟悉度高。
+- **SPIR-V 直接手写 / 用其他着色语言**：GLSL 生态成熟但模块化弱；改用 Slang 以获得 module/import 与跨 API 代码生成能力（见 ADR 0011）。
 
 ## 后果
 

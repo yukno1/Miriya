@@ -1,3 +1,3 @@
-//! Miriya GLSL/SPIR-V shader pipeline
+//! Miriya Slang/SPIR-V shader pipeline
 //!
 //! 结构占位：具体实现见 README 的对应里程碑。

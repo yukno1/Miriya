@@ -85,7 +85,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 | `Engine/Source/{Runtime,Editor,Developer,Programs,ThirdParty}` | C++ 模块、工具与第三方库 | 模块划分与 API 语义的主要参考 |
 | `Engine/Build` | UBT 构建脚本、版本信息 | 构建/打包流程的参考 |
 | `Engine/Config` | `Base*.ini` 配置体系 | 配置项语义参考（Miriya 用 TOML） |
-| `Engine/Shaders/{Private,Public,Shared}` | HLSL 着色器与 `.ush` 公共库 | 材质/光照管线的语义参考（Miriya 用 GLSL/SPIR-V） |
+| `Engine/Shaders/{Private,Public,Shared}` | HLSL 着色器与 `.ush` 公共库 | 材质/光照管线的语义参考（Miriya 用 Slang/SPIR-V） |
 | `Engine/Platforms` + `Binaries` | 平台抽象与预编译二进制 | 平台支持范围的参照 |
 | `Engine/Plugins` | 76 个一级插件目录 | 插件化架构的参照 |
 | `Samples/Games/Lyra`、`Templates`（37 个模板） | 示例与游戏模板（第一/第三人称等） | **v1.0 的验收蓝本**（TP_FirstPerson / TP_ThirdPerson） |
@@ -188,7 +188,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 | Actor/Component + World | `Engine` 4,007 文件 | Actor 为「带层级/反射元数据的实体」，数据组件进 ECS；不做 C++ 继承/虚表 | 缓存友好、易并行；代价是保留一层 Actor 兼容外观 |
 | Chaos / 物理引擎 | 大规模自研 | **不实现**；`mir-physics` 只提供 `PhysicsBackend` 接口，外部后端注入 | 引擎不背求解器维护成本，用户可用自研后端；代价是后端契约、集成与性能由外部负责 |
 | Lumen / Nanite | 持续多年研发 | Clustered Forward+、CSM/IBL/SSAO；GI/虚拟几何列为研究 | 先保证稳定可玩；不承诺实时全局光照 |
-| 图形 API / RHI | 多后端（DX12/Vulkan/Metal） | **唯一 Vulkan 1.3 后端（vulkanalia）**；GLSL→SPIR-V | 单后端缩小矩阵，Windows/Linux 复用；代价是没有 DX12 兜底，驱动兼容性需矩阵测试 |
+| 图形 API / RHI | 多后端（DX12/Vulkan/Metal） | **唯一 Vulkan 1.3 后端（vulkanalia）**；Slang→SPIR-V | 单后端缩小矩阵，Windows/Linux 复用；代价是没有 DX12 兜底，驱动兼容性需矩阵测试 |
 | Slate / UMG | 464 + 314 文件 | 运行时自研保留式 UI（`mir-ui`）；编辑器核心 `mir-editor-core` 与 UI 框架解耦（GPUI 候选 / egui 可选） | 运行时与工具分离、UI 可替换；代价是需维护 UI 适配层与视口合成方案 |
 | `.uasset` / IoStore / Pak | 复杂二进制 | 自有 `.miasset` / `.mipak`，mmap + 压缩块 | 简单、可版本化、可 fuzz；代价是迁移需导入器 |
 | UBT / UHT / AutomationTool | C# 工具链 | cargo + xtask + 过程宏 + `miriya-cli` | 与 Rust 生态一致；代价是构建缓存/增量需自建 |
@@ -199,7 +199,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 **核心依赖选型**（版本在 M0 统一钉在 `[workspace.dependencies]`，以实际兼容性为准）：
 
 - 窗口/输入：`winit`、`gilrs`、`raw-window-handle`
-- 图形：**`vulkanalia`**（唯一图形后端）、自研 Vulkan 子分配器、`shaderc`（GLSL→SPIR-V）、`spirv-reflect`、`bytemuck`
+- 图形：**`vulkanalia`**（唯一图形后端）、自研 Vulkan 子分配器、`slangc`（Slang→SPIR-V，离线预编译）、`spirv-reflect`、`bytemuck`
 - 数学：`glam`
 - ECS：`hecs`（内部实现，API 可换）
 - 物理：**无内置求解器**；`mir-physics` 只定义接口与调度，实际后端为独立 crate/插件（用户自研）
@@ -424,7 +424,7 @@ Miriya/
 │   ├── mir-scene/              # Level/Actor/Component
 │   ├── mir-asset/              # 资产服务器/注册表/导入器
 │   ├── mir-serialize/          # 版本化序列化
-│   ├── mir-shader/             # GLSL→SPIR-V、反射、缓存、热重载
+│   ├── mir-shader/             # Slang→SPIR-V、反射、缓存、热重载
 │   ├── mir-render/             # Vulkan（vulkanalia）与 RenderGraph（M2）
 │   ├── mir-window/             # winit 窗口
 │   ├── mir-input/              # 输入动作映射
@@ -456,7 +456,7 @@ Miriya/
 │   ├── adr/                    # 架构决策记录 NNNN-*.md
 │   ├── book/                   # mdbook 手册
 │   └── rfcs/                   # 大特性提案
-├── shaders/                    # GLSL 源与公共 chunk
+├── shaders/                    # Slang 源与公共 module
 └── tests/                      # 跨 crate 集成/golden/基准
 ```
 
@@ -468,7 +468,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染、GLSL/SPIR-V 管线与三角形绘制 | 🟡 原型 | RenderGraph、网格/材质、验证层与多帧在飞行（M2） |
+| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染、Slang/SPIR-V 管线与三角形绘制 | 🟡 原型 | RenderGraph、网格/材质、验证层与多帧在飞行（M2） |
 | `mir-window` | winit 0.30 窗口与事件循环，实现 `HasWindowHandle`/`HasDisplayHandle`，窗口创建回调 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M1/M2） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
@@ -542,10 +542,10 @@ Miriya/
 |---|---|---|---|---:|
 | **M0** | 工程基线收敛 | workspace 收敛、LICENSE、CI、rust-toolchain、ADR、拍平/成员补齐、facade 导出修正、`vulkanalia`/`.NET LTS` 依赖 spike | `cargo fmt/clippy/test --workspace` 全绿；Windows 测试 + Linux 编译检查 | 2 |
 | **M1** | 平台与循环（Windows） | winit 窗口/事件、Linux 平台 trait 占位、退出链路、输入快照、日志桥接、帧统计、`FramePipeline` | 打开窗口、按键/缩放、关闭可退出、headless 1000 帧测试、Linux `cargo check` 通过 | 4 |
-| **M2** | 渲染 v0（Vulkan） | `vulkanalia` 实例/设备/交换链、GLSL→SPIR-V、深度、相机、网格/实例、基础 PBR、RenderGraph、管线缓存 | v0.2「旋转立方体 + 自由相机」1080p 稳定；Vulkan 校验层无错误 | 12 |
+| **M2** | 渲染 v0（Vulkan） | `vulkanalia` 实例/设备/交换链、Slang→SPIR-V、深度、相机、网格/实例、基础 PBR、RenderGraph（含单 `.spv` 多入口整合）、管线缓存 | v0.2「旋转立方体 + 自由相机」1080p 稳定；Vulkan 校验层无错误 | 12 |
 | **M3** | 场景与 ECS | hecs 封装、Actor/Component、层级变换、序列化往返、场景加载/保存 | 10k 实体变换基准达标；关卡存取 golden 一致 | 8 |
 | **M4** | 资产管线 | 异步加载、注册表、glTF/纹理/音频导入、依赖图、热重载、`.miasset` | 1 GB 场景不卡主线程；热重载 200 ms 内生效 | 10 |
-| **M5** | 材质与光照 | GLSL chunk、材质参数/纹理、IBL、CSM、SSAO、Bloom/色调映射 | v0.3「PBR 场景」1080p 60fps（中端独显） | 10 |
+| **M5** | 材质与光照 | Slang module、材质参数/纹理、IBL、CSM、SSAO、Bloom/色调映射 | v0.3「PBR 场景」1080p 60fps（中端独显） | 10 |
 | **M6** | 物理接口（不含实现） | `PhysicsBackend` trait、世代句柄、固定步驱动、查询/事件/调试绘制、Null 后端、可复用契约测试 | mock 后端通过契约测试；外部后端可按文档接入；仓库内无求解器 | 6 |
 | **M7** | 游戏框架与输入 | GameMode/Pawn/Controller、输入 Action 映射、HUD 接口、存档 | 可玩 FPS 闭环的 Rust 侧骨架（移动/射击/死亡/重开） | 6 |
 | **M8** | C# 脚本运行时 | .NET 10 hostfxr 托管、版本化 C ABI、绑定生成、脚本生命周期、可卸载 ALC 热重载、C# 模板 | **用 C# 实现玩家移动/生成 Actor**；热重载 ≤ 1 s；无任何蓝图依赖 | 8 |
@@ -652,7 +652,8 @@ Miriya/
   不引入 ash）；交换链重建/设备丢失有恢复路径。
 - **管线**：Clustered Forward+：CSM 阴影 → 深度预通道 → 不透明（PBR + IBL）→ 透明 → SSAO/Bloom/色调映射 → UI。
 - **RenderGraph**：pass 声明读写、自动 barrier/layout 转换、临时纹理别名、GPU 时间戳；每帧可 dump 依赖图。
-- **着色器**：GLSL 4.60（公共 chunk + 自研 include）经 `shaderc` 编译为 SPIR-V；`spirv-reflect` 生成绑定；
+- **着色器**：Slang（公共 module + `import`）经 `slangc` 直接编译为 SPIR-V；当前按阶段输出两个 `.spv`，
+  阶段入口统一为 `main`，单 `.spv` 多入口随 M2 RenderGraph 重构一起处理；`spirv-reflect` 生成绑定；
   `spirv-val` 与校验层把关；离线缓存以管线哈希为键；开发模式热重载；材质参数走 UBO/SSBO。
 - **平台**：Vulkan 为 Windows/Linux 通用 API；启用 Linux 时只需替换 surface/平台后端，渲染代码不变。
 - **运行前提**：Windows 10/11 x64 + 支持 Vulkan 1.3 的显卡驱动；启动时检测 API/特性并给出可读错误，
@@ -788,7 +789,7 @@ Miriya/
 | `.miasset` | 通用资产容器 | 头 + zstd 负载 | 网格/材质/纹理元数据共用容器，type tag 区分 |
 | `.mimap` | 关卡 | 头 + 反射序列化 | Actor/组件/层级/流式单元 |
 | `.mipak` | 烘焙包 | 索引 + 压缩块 | 运行时挂载，mmap |
-| `.glsl` / `.spv` | 着色器源/编译产物 | GLSL 4.60 / SPIR-V | `shaderc` 编译；缓存按管线哈希 |
+| `.slang` / `.spv` | 着色器源/编译产物 | Slang / SPIR-V | `slangc` 直接编译；缓存按管线哈希 |
 | `managed/*.csproj` | C# 脚本项目 | C# 源 + .NET 10 工程 | `dotnet build`；生成绑定来自 `mir-bindgen` |
 | `.dll` / `.deps.json` | C# 运行时程序集 | .NET 程序集 | 随包分发；开发期可卸载 ALC 热重载 |
 | 导入源 | glTF/GLB、PNG/KTX2、WAV/OGG/FLAC | 标准格式 | 构建期转换，不进入运行时 |
@@ -1028,17 +1029,18 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] **M2 第三阶段**：`mir-render` 用 Vulkan 1.3 动态渲染完成每帧清屏，并经命令缓冲提交、`acquire →
       present` 真正呈现到窗口；单帧在飞行（fence + 双 semaphore）同步，窗口缩放时重建交换链。
       `frame_error()` 暴露帧级错误，示例应用退出时输出；`cargo run -- --frames 60` 无渲染错误。
-- [x] **M2 第四阶段（v0.1 Hello GPU）**：`shaders/hello/triangle.{vert,frag}` GLSL 源与校验过的 SPIR-V
-      落盘；`mir-render` 创建着色器模块与动态渲染图形管线，用 `gl_VertexIndex` 绘制彩色三角形
-      （无顶点缓冲）。交换链格式变化时重建管线；`cargo run -- --frames 60` 无渲染错误。
+- [x] **M2 第四阶段（v0.1 Hello GPU）**：`shaders/hello/triangle.slang` 单文件包含顶点/片元入口，
+      经 Slang 编译与 `spirv-val` 校验的 SPIR-V 落盘；`mir-render` 创建着色器模块与动态渲染图形管线，
+      用 `SV_VertexID` 绘制彩色三角形（无顶点缓冲）。交换链格式变化时重建管线；`cargo run -- --frames 60` 无渲染错误。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已能清屏并绘制 `gl_VertexIndex` 三角形，但尚无网格/材质、RenderGraph、深度测试、
-   多帧在飞行；验证层未启用，着色器目前通过 Vulkan SDK 离线编译而非运行时 shaderc（M2 剩余范围）。
+3. `mir-render` 已能清屏并绘制 `SV_VertexID` 三角形，但尚无网格/材质、RenderGraph、深度测试、
+   多帧在飞行；验证层未启用，着色器目前通过 `slangc` 离线编译而非运行时编译；当前按阶段输出两个 `.spv`，
+   单 `.spv` 多入口随 RenderGraph 重构处理（均为 M2 剩余范围）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
@@ -1067,10 +1069,11 @@ cargo run -- --headless --frames 1000
 # Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
 cargo run -p mir-vulkan-probe
 
-# 修改 shaders/hello/*.vert|frag 后，重新编译 SPIR-V（需 Vulkan SDK）
-glslangValidator -V shaders/hello/triangle.vert -o shaders/hello/triangle.vert.spv
-glslangValidator -V shaders/hello/triangle.frag -o shaders/hello/triangle.frag.spv
+# 修改 shaders/hello/*.slang 后，重新编译 SPIR-V（需 Slang 编译器，可由 Vulkan SDK 或 Slang release 提供）
+slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
+slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
 spirv-val shaders/hello/triangle.vert.spv
+spirv-val shaders/hello/triangle.frag.spv
 ```
 
 `cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
@@ -1084,7 +1087,7 @@ spirv-val shaders/hello/triangle.vert.spv
       新模块接入时继续检查依赖方向。
 - [x] 添加 `rust-toolchain.toml`、`.editorconfig`。
 - [x] 添加 `LICENSE-MIT`、`LICENSE-APACHE`、`global.json`。
-- [x] CI：Windows（fmt/clippy/test + .NET 10 `dotnet build`）+ Linux `cargo check`（接口检查）；已配置 Cargo 缓存。
+- [x] CI：Windows（Slang shader 编译 + fmt/clippy/test + .NET 10 `dotnet build`）+ Linux（Slang shader 编译 + `cargo check` 接口检查）；已配置 Cargo 缓存。
 - [x] `vulkanalia` 最小 PoC（`tools/mir-vulkan-probe`）：实例/物理设备/逻辑设备/surface/交换链前置查询全链路
       本机实测通过（Loader 1.4.341、Intel Iris Xe、Vulkan 1.3、B8G8R8A8_UNORM/IMMEDIATE），
       风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 10 hostfxr 托管 PoC 属 M8 前置。
@@ -1092,9 +1095,9 @@ spirv-val shaders/hello/triangle.vert.spv
       两 crate 的骨架已落地并通过 `cargo test --workspace` 与 Clippy `-D warnings`；
       `thiserror = "2"` 已纳入 `[workspace.dependencies]`。
 - [x] 建立 `docs/adr/` 目录。
-- [x] 撰写首批 ADR 0001–0010（布局、ECS、坐标系、渲染管线、Vulkan 单后端、C# 脚本运行时、
-      Windows-only/Linux 接口、物理后端接口、编辑器 UI 后端选型、Rust-first API/1:1 边界）；
-      其中 ADR-0009 为 Proposed，待 M12 spike 定稿。
+- [x] 撰写 ADR 0001–0011（布局、ECS、坐标系、渲染管线、Vulkan 单后端、C# 脚本运行时、
+      Windows-only/Linux 接口、物理后端接口、编辑器 UI 后端选型、Rust-first API/1:1 边界、着色器语言迁移到 Slang）；
+      其中 ADR-0009 为 Proposed，待 M12 spike 定稿；ADR-0004 的着色器语言部分由 ADR-0011 取代。
 - [x] 主循环可退出 + headless 测试：`max_frames` / 窗口关闭 / Esc 均可退出；`headless_1000_frames` 通过。
 - [x] M1：winit 窗口与事件循环、键鼠映射、输入快照、帧统计、退出链路（Linux CI 已装 X11/Wayland 依赖）。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）。
@@ -1109,7 +1112,7 @@ spirv-val shaders/hello/triangle.vert.spv
 - UE 官方文档：<https://dev.epicgames.com/documentation/unreal-engine>
 - Rust API Guidelines：<https://rust-lang.github.io/api-guidelines/>
 - Vulkan 规范：<https://docs.vulkan.org/> · vulkanalia：<https://github.com/KyleMayes/vulkanalia>
-- shaderc：<https://github.com/google/shaderc> · SPIR-V：<https://www.khronos.org/spir/>
+- Slang：<https://github.com/shader-slang/slang> · SPIR-V：<https://www.khronos.org/spir/>
 - .NET 10：<https://dotnet.microsoft.com/> · hostfxr 托管：<https://learn.microsoft.com/dotnet/core/tutorials/netcore-hosting>
 - winit：<https://github.com/rust-windowing/winit> · glam：<https://github.com/bitshifter/glam-rs>
 - hecs：<https://github.com/Ralith/hecs> · glTF 2.0：<https://www.khronos.org/gltf/>
@@ -1128,7 +1131,8 @@ spirv-val shaders/hello/triangle.vert.spv
 | Actor / Component | 关卡中的对象及其可组合能力；Miriya 用「实体 + 组件 + 元数据」实现 |
 | PIE | Play In Editor，编辑器内运行游戏 |
 | Vulkan / vulkanalia | Miriya 唯一的图形后端；vulkanalia 是 Rust 的 Vulkan 绑定与辅助层 |
-| SPIR-V | Vulkan 使用的着色器中间格式；Miriya 由 GLSL 经 shaderc 编译得到 |
+| Slang | Miriya 的唯一着色器源语言；支持 module/import，经 `slangc` 直接生成 SPIR-V |
+| SPIR-V | Vulkan 使用的着色器中间格式；Miriya 由 Slang 经 `slangc` 直接编译得到 |
 | C# / .NET 10 | 唯一的玩法脚本语言与运行时；通过 hostfxr 在引擎进程内托管 |
 | PhysicsBackend | 外部物理后端契约；Miriya 只提供接口、调度与契约测试，不含求解器 |
 | mir-editor-core / UI 后端 | 编辑器核心（UI 无关）与可插拔 UI 适配层（GPUI/egui），后者不进入运行时 |

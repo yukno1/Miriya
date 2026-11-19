@@ -7,13 +7,31 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SLANG_VERSION: 2026.8
 
 jobs:
   windows:
-    name: Windows (fmt / clippy / test / dotnet)
+    name: Windows (shader / fmt / clippy / test / dotnet)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Slang compiler
+        shell: pwsh
+        run: |
+          $url = "https://github.com/shader-slang/slang/releases/download/v${env:SLANG_VERSION}/slang-${env:SLANG_VERSION}-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile slang.zip
+          Expand-Archive slang.zip -DestinationPath slang -Force
+          Add-Content -Path $env:GITHUB_PATH -Value "$pwd\slang\bin"
+
+      - name: Compile shaders with Slang
+        shell: pwsh
+        run: |
+          slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code -- shaders/hello/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,10 +62,27 @@ jobs:
         run: dotnet build managed/Miriya.Scripting/Miriya.Scripting.csproj -c Release
 
   linux:
-    name: Linux (interface check)
+    name: Linux (shader / interface check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Slang compiler
+        shell: bash
+        run: |
+          url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz"
+          curl -L "$url" -o slang.tar.gz
+          mkdir -p slang
+          tar -xzf slang.tar.gz -C slang
+          chmod +x slang/bin/slangc
+          echo "$GITHUB_WORKSPACE/slang/bin" >> "$GITHUB_PATH"
+
+      - name: Compile shaders with Slang
+        shell: bash
+        run: |
+          slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
+          slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
+          git diff --exit-code -- shaders/hello/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

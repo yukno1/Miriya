@@ -2,4 +2,4 @@
 name = "mir-shader"
 version.workspace = true
 edition.workspace = true
-description = "Miriya GLSL/SPIR-V shader pipeline"
+description = "Miriya Slang/SPIR-V shader pipeline"
