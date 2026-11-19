@@ -20,7 +20,7 @@ impl Game {
             player,
             Transform {
                 position: Vec3::new(0.0, 0.0, 0.0),
-                scale: Vec3::ONE,
+                ..Default::default()
             },
         );
         Self { world, player }

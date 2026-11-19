@@ -8,7 +8,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::vk::{
-    DeviceV1_3, KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands,
+    DeviceV1_3, InstanceV1_1, KhrSurfaceExtensionInstanceCommands,
+    KhrSwapchainExtensionDeviceCommands,
 };
 use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
@@ -23,7 +24,8 @@ struct FrameResources {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
+    /// 每张交换链图像一个呈现信号量：避免同一信号量在“已呈现但尚未重新 acquire”的图像间复用。
+    render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
 }
 
@@ -39,6 +41,8 @@ pub(super) struct VulkanCore {
     pipeline: Option<PipelineResources>,
     frame: Option<FrameResources>,
     image_views: Vec<vk::ImageView>,
+    /// 交换链图像句柄，用于每帧的 layout 转换（由交换链持有，不单独销毁）。
+    swapchain_images: Vec<vk::Image>,
     swapchain: Option<vk::SwapchainKHR>,
     surface: Option<vk::SurfaceKHR>,
     device: Device,
@@ -204,6 +208,28 @@ impl VulkanCore {
         let (physical_device, graphics_family, present_family, device_name, api_version) =
             chosen.ok_or(RenderInitError::NoDevice)?;
 
+        // 查询并校验本渲染器依赖的两项可选特性：
+        // - shaderDrawParameters：Slang 对 `SV_VertexID` 会声明 DrawParameters 能力；
+        // - dynamicRendering：整个渲染路径都走 `vkCmdBeginRendering`，没有 render pass。
+        let mut probe11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut probe13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut probe2 = vk::PhysicalDeviceFeatures2::builder()
+            .push_next(&mut probe11)
+            .push_next(&mut probe13)
+            .build();
+        // SAFETY: physical_device 来自本实例的有效枚举结果；特性结构链在调用期间有效。
+        unsafe { instance.get_physical_device_features2(physical_device, &mut probe2) };
+        if probe11.shader_draw_parameters == 0 {
+            return Err(RenderInitError::Device(
+                "设备不支持 shaderDrawParameters（Vulkan 1.1 可选特性）".into(),
+            ));
+        }
+        if probe13.dynamic_rendering == 0 {
+            return Err(RenderInitError::Device(
+                "设备不支持 dynamicRendering（Vulkan 1.3 可选特性）".into(),
+            ));
+        }
+
         let priorities = [1.0_f32];
         let mut queue_infos = vec![
             vk::DeviceQueueCreateInfo::builder()
@@ -226,10 +252,19 @@ impl VulkanCore {
         } else {
             Vec::new()
         };
+        // 创建逻辑设备时启用已校验过的特性（用独立的链，避免复用查询阶段的 pNext）。
+        let mut features11 = vk::PhysicalDeviceVulkan11Features::builder()
+            .shader_draw_parameters(true)
+            .build();
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::builder()
+            .dynamic_rendering(true)
+            .build();
         let device_info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_infos)
-            .enabled_extension_names(&device_extensions);
-        // SAFETY: physical_device 支持所选队列族；device_info 及扩展名数组在调用期间有效。
+            .enabled_extension_names(&device_extensions)
+            .push_next(&mut features11)
+            .push_next(&mut features13);
+        // SAFETY: physical_device 支持所选队列族与已查询的特性；device_info 及扩展名数组在调用期间有效。
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(|error| RenderInitError::Device(error.to_string()))?;
         // SAFETY: device 有效，且创建时请求了这两个队列族。
@@ -276,6 +311,7 @@ impl VulkanCore {
             pipeline: None,
             frame: None,
             image_views: Vec::new(),
+            swapchain_images: Vec::new(),
             swapchain: None,
             surface,
             device,
@@ -367,7 +403,7 @@ impl VulkanCore {
             .map_err(|error| RenderInitError::Swapchain(error.to_string()))?;
 
         let mut views = Vec::with_capacity(images.len());
-        for image in images {
+        for &image in &images {
             let subresource = vk::ImageSubresourceRange::builder()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
@@ -388,6 +424,7 @@ impl VulkanCore {
         }
         self.swapchain = Some(swapchain);
         self.image_views = views;
+        self.swapchain_images = images;
         self.extent = extent;
         Ok(())
     }
@@ -418,9 +455,13 @@ impl VulkanCore {
         // SAFETY: semaphore_info 有效。
         let image_available = unsafe { self.device.create_semaphore(&semaphore_info, None) }
             .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
-        // SAFETY: semaphore_info 有效。
-        let render_finished = unsafe { self.device.create_semaphore(&semaphore_info, None) }
-            .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+        let mut render_finished = Vec::with_capacity(self.image_views.len());
+        for _ in 0..self.image_views.len() {
+            // SAFETY: semaphore_info 有效。
+            let semaphore = unsafe { self.device.create_semaphore(&semaphore_info, None) }
+                .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+            render_finished.push(semaphore);
+        }
 
         self.frame = Some(FrameResources {
             command_pool,
@@ -430,6 +471,32 @@ impl VulkanCore {
             render_finished,
             extent: self.extent,
         });
+        Ok(())
+    }
+
+    /// 交换链重建后同步更新呈现信号量（数量跟随交换链图像数）。
+    ///
+    /// 调用方必须先 `device_wait_idle`，否则旧信号量可能仍被呈现操作引用。
+    fn recreate_render_finished(&mut self) -> Result<(), String> {
+        let semaphore_info = vk::SemaphoreCreateInfo::builder();
+        let image_count = self.image_views.len();
+        let frame = self
+            .frame
+            .as_mut()
+            .ok_or_else(|| "帧资源尚未初始化".to_string())?;
+
+        // SAFETY: device 已空闲，旧信号量不再被任何提交或呈现操作引用。
+        unsafe {
+            for semaphore in frame.render_finished.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+        }
+        for _ in 0..image_count {
+            // SAFETY: semaphore_info 有效。
+            let semaphore = unsafe { self.device.create_semaphore(&semaphore_info, None) }
+                .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+            frame.render_finished.push(semaphore);
+        }
         Ok(())
     }
 
@@ -594,6 +661,40 @@ impl VulkanCore {
                 .begin_command_buffer(frame.command_buffer, &begin_info)
                 .map_err(|error| format!("开始命令缓冲录制失败: {error}"))?;
 
+            let image = self.swapchain_images[index as usize];
+            // 空切片需要显式类型，否则无法推导 `Cast` 目标。
+            let no_memory_barriers: [vk::MemoryBarrier; 0] = [];
+            let no_buffer_barriers: [vk::BufferMemoryBarrier; 0] = [];
+            let subresource = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build();
+
+            // 从“未定义”转到颜色附件：本帧首操作是 CLEAR，旧内容本就要丢弃，
+            // 因此用 UNDEFINED 作 oldLayout 即可，无需跟踪每张图像的历史布局。
+            let to_color_attachment = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                frame.command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &no_memory_barriers,
+                &no_buffer_barriers,
+                &[to_color_attachment],
+            );
+
             let clear = vk::ClearValue {
                 color: vk::ClearColorValue {
                     float32: clear_color,
@@ -639,6 +740,28 @@ impl VulkanCore {
                 self.device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
             }
             self.device.cmd_end_rendering(frame.command_buffer);
+
+            // 呈现前转回 PRESENT_SRC_KHR，保证 next acquire 与 present engine 看到一致的布局。
+            let to_present = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .build();
+            self.device.cmd_pipeline_barrier(
+                frame.command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &no_memory_barriers,
+                &no_buffer_barriers,
+                &[to_present],
+            );
+
             self.device
                 .end_command_buffer(frame.command_buffer)
                 .map_err(|error| format!("结束命令缓冲录制失败: {error}"))?;
@@ -646,7 +769,9 @@ impl VulkanCore {
             let wait_semaphores = [frame.image_available];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = [frame.command_buffer];
-            let signal_semaphores = [frame.render_finished];
+            // 用本张图像专属的呈现信号量，避免在图像未重新 acquire 前复用。
+            let render_finished = frame.render_finished[index as usize];
+            let signal_semaphores = [render_finished];
             let submit = vk::SubmitInfo::builder()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&stages)
@@ -657,7 +782,7 @@ impl VulkanCore {
                 .queue_submit(self.graphics_queue, &submits, frame.fence)
                 .map_err(|error| format!("提交命令缓冲失败: {error}"))?;
 
-            let present_wait = [frame.render_finished];
+            let present_wait = [render_finished];
             let swapchains = [swapchain];
             let image_indices = [index];
             let present = vk::PresentInfoKHR::builder()
@@ -687,9 +812,12 @@ impl VulkanCore {
             // SAFETY: swapchain 由本对象创建且设备已空闲。
             unsafe { self.device.destroy_swapchain_khr(swapchain, None) };
         }
+        // 旧交换链的图像句柄随交换链销毁而失效，重建前先清空，避免引用悬垂句柄。
+        self.swapchain_images.clear();
         let old_format = self.format_value;
         self.create_swapchain(width.max(1), height.max(1))
             .map_err(|error| error.to_string())?;
+        self.recreate_render_finished()?;
         if self.format_value != old_format {
             self.destroy_pipeline();
             self.init_pipeline()?;
@@ -703,22 +831,27 @@ impl VulkanCore {
 
 impl Drop for VulkanCore {
     fn drop(&mut self) {
-        // SAFETY: 本对象仍持有有效的 Vulkan 句柄；按 frame → image views → swapchain → surface → device → instance 逆序释放。
+        // SAFETY: 本对象仍持有有效的 Vulkan 句柄；先等待 GPU 空闲，再按
+        // pipeline → frame → image views → swapchain → surface → device → instance 逆序释放。
         unsafe {
-            self.destroy_pipeline();
             if let Some(frame) = self.frame.take() {
                 let _ = self.device.device_wait_idle();
-                self.device.destroy_semaphore(frame.render_finished, None);
+                for semaphore in frame.render_finished {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
                 self.device.destroy_semaphore(frame.image_available, None);
                 self.device.destroy_fence(frame.fence, None);
                 self.device.destroy_command_pool(frame.command_pool, None);
             }
+            // 管线销毁必须发生在命令缓冲执行完毕之后。
+            self.destroy_pipeline();
             for view in self.image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
             if let Some(swapchain) = self.swapchain.take() {
                 self.device.destroy_swapchain_khr(swapchain, None);
             }
+            self.swapchain_images.clear();
             if let Some(surface) = self.surface.take() {
                 self.instance.destroy_surface_khr(surface, None);
             }

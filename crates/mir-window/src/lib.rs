@@ -9,12 +9,12 @@ pub use event::{ButtonState, WindowEvent};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent as WinitWindowEvent;
+use winit::event::{DeviceEvent as WinitDeviceEvent, WindowEvent as WinitWindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
-use winit::window::{Window as WinitWindow, WindowAttributes};
+use winit::window::{CursorGrabMode, Window as WinitWindow, WindowAttributes};
 
 use event::{map_element_state, map_mouse_button, map_physical_key};
 
@@ -42,8 +42,8 @@ pub trait WindowApp {
     fn on_window_created(&mut self, _window: &Window) {}
     /// 处理一个窗口事件。
     fn on_event(&mut self, event: WindowEvent);
-    /// 每帧更新与渲染（由 `about_to_wait` 驱动）。
-    fn on_frame(&mut self);
+    /// 每帧更新与渲染（由 `about_to_wait` 驱动）；`window` 供光标捕获等平台操作使用。
+    fn on_frame(&mut self, window: &Window);
     /// 返回 `true` 请求退出事件循环。
     fn should_exit(&self) -> bool;
 }
@@ -77,6 +77,28 @@ impl Window {
             .display_handle()
             .expect("窗口应提供 raw display handle");
         handle.as_raw()
+    }
+
+    /// 锁定/释放鼠标光标：锁定优先 `Locked`，失败回退 `Confined`；成功时隐藏光标。
+    ///
+    /// 返回是否按请求进入了锁定状态（释放时总是返回 `true`）。
+    /// 失去焦点时应调用 `set_cursor_captured(false)`，避免光标卡死。
+    pub fn set_cursor_captured(&self, captured: bool) -> bool {
+        if captured {
+            let grabbed = self
+                .inner
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.inner.set_cursor_grab(CursorGrabMode::Confined));
+            let ok = grabbed.is_ok();
+            if ok {
+                self.inner.set_cursor_visible(false);
+            }
+            ok
+        } else {
+            let _ = self.inner.set_cursor_grab(CursorGrabMode::None);
+            self.inner.set_cursor_visible(true);
+            true
+        }
     }
 }
 
@@ -150,6 +172,13 @@ impl<A: WindowApp> ApplicationHandler for Runner<'_, A> {
             _ => None,
         };
 
+        // 失焦时强制释放光标，避免用户切走窗口后鼠标被锁死；应用层收到 Focused(false) 后自行改状态。
+        if let Some(WindowEvent::Focused(false)) = translated.as_ref()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.set_cursor_captured(false);
+        }
+
         if let Some(event) = translated {
             self.app.on_event(event);
         }
@@ -160,12 +189,27 @@ impl<A: WindowApp> ApplicationHandler for Runner<'_, A> {
         }
     }
 
+    /// 转发原始鼠标位移：视角控制需要不受窗口边界限制的增量。
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: WinitDeviceEvent,
+    ) {
+        if let WinitDeviceEvent::MouseMotion { delta } = event {
+            self.app.on_event(WindowEvent::MouseMotion {
+                dx: delta.0 as f32,
+                dy: delta.1 as f32,
+            });
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.exit {
             return;
         }
-        if self.window.is_some() {
-            self.app.on_frame();
+        if let Some(window) = self.window.as_ref() {
+            self.app.on_frame(window);
         }
         if self.app.should_exit() {
             self.exit = true;

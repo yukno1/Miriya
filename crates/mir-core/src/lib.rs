@@ -52,12 +52,21 @@ pub struct EngineContext {
     pub renderer: mir_render::RenderContext,
     pub assets: mir_asset::AssetServer,
     pub stats: FrameStats,
+    /// 待应用到窗口的光标捕获请求；由主循环消费（headless 下不会被消费）。
+    cursor_capture_request: Option<bool>,
 }
 
 impl EngineContext {
     /// 请求退出引擎主循环。
     pub fn request_exit(&mut self) {
         self.renderer.exit_requested = true;
+    }
+
+    /// 请求锁定/释放鼠标光标；主循环在下一帧应用到窗口。
+    ///
+    /// 无窗口（headless）运行时该请求不会被消费，也不产生副作用。
+    pub fn set_cursor_captured(&mut self, captured: bool) {
+        self.cursor_capture_request = Some(captured);
     }
 
     /// 平台层：把窗口事件翻译成输入状态与退出请求。
@@ -72,6 +81,7 @@ impl EngineContext {
             WindowEvent::CursorMoved { x, y } => {
                 self.input.set_mouse_pos(mir_math::Vec2::new(x, y));
             }
+            WindowEvent::MouseMotion { dx, dy } => self.input.set_mouse_delta(dx, dy),
             WindowEvent::MouseButton { button, state } => match state {
                 ButtonState::Pressed => self.input.press_mouse(button),
                 ButtonState::Released => self.input.release_mouse(button),
@@ -97,6 +107,7 @@ fn make_context(config: &EngineConfig) -> EngineContext {
         renderer: mir_render::RenderContext::new(config.width, config.height),
         assets: mir_asset::AssetServer::new(),
         stats: FrameStats::default(),
+        cursor_capture_request: None,
     }
 }
 
@@ -141,9 +152,17 @@ impl WindowApp for FrameDriver<'_> {
         self.ctx.on_window_event(event);
     }
 
-    fn on_frame(&mut self) {
+    fn on_frame(&mut self, window: &mir_window::Window) {
         let target = frame_target(&self.config);
         tick(&mut self.ctx, self.app, Instant::now(), target);
+
+        // 应用本帧新产生的光标捕获请求（在 update 之后，使状态当帧生效）。
+        if let Some(captured) = self.ctx.cursor_capture_request.take()
+            && !window.set_cursor_captured(captured)
+        {
+            eprintln!("光标捕获失败：请求 {captured}");
+        }
+
         if self
             .config
             .max_frames
@@ -261,6 +280,9 @@ mod tests {
         assert!(ctx.input.is_down(mir_input::KeyCode::W));
         assert!(ctx.input.just_pressed(mir_input::KeyCode::W));
 
+        ctx.on_window_event(WindowEvent::MouseMotion { dx: 4.0, dy: -3.0 });
+        assert_eq!(ctx.input.mouse_delta(), mir_math::Vec2::new(4.0, -3.0));
+
         ctx.on_window_event(WindowEvent::Resized {
             width: 800,
             height: 600,
@@ -269,5 +291,21 @@ mod tests {
 
         ctx.on_window_event(WindowEvent::CloseRequested);
         assert!(ctx.renderer.exit_requested);
+    }
+
+    #[test]
+    fn cursor_capture_request_is_recorded_once() {
+        let mut ctx = make_context(&EngineConfig::default());
+        assert_eq!(ctx.cursor_capture_request, None);
+
+        ctx.set_cursor_captured(true);
+        assert_eq!(ctx.cursor_capture_request, Some(true));
+
+        ctx.set_cursor_captured(false);
+        assert_eq!(ctx.cursor_capture_request, Some(false));
+
+        // 主循环消费后回到 None（headless 下不会被消费，仍保留请求）。
+        assert_eq!(ctx.cursor_capture_request.take(), Some(false));
+        assert_eq!(ctx.cursor_capture_request, None);
     }
 }

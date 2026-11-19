@@ -22,6 +22,10 @@ pub enum WindowEvent {
     Keyboard { key: KeyCode, state: ButtonState },
     /// 鼠标移动（窗口坐标，左上角为原点）。
     CursorMoved { x: f32, y: f32 },
+    /// 原始鼠标位移（不受窗口边界/系统加速度限制；单位由平台决定）。
+    ///
+    /// 用于视角控制；平台层会无条件转发，是否消费由应用层决定。
+    MouseMotion { dx: f32, dy: f32 },
     /// 鼠标按钮状态变化。
     MouseButton {
         button: MouseButton,

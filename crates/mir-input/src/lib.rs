@@ -94,6 +94,7 @@ pub struct InputState {
     released: HashSet<KeyCode>,
     held: HashSet<KeyCode>,
     mouse_pos: mir_math::Vec2,
+    mouse_delta: mir_math::Vec2,
     mouse_buttons: HashSet<MouseButton>,
     pressed_mouse: HashSet<MouseButton>,
     released_mouse: HashSet<MouseButton>,
@@ -137,6 +138,16 @@ impl InputState {
         self.mouse_pos = pos;
     }
 
+    /// 平台层调用：累积原始鼠标位移（本帧多次事件求和）。
+    pub fn set_mouse_delta(&mut self, dx: f32, dy: f32) {
+        self.mouse_delta += mir_math::Vec2::new(dx, dy);
+    }
+
+    /// 本帧累计的原始鼠标位移（视角控制用），帧末清零。
+    pub fn mouse_delta(&self) -> mir_math::Vec2 {
+        self.mouse_delta
+    }
+
     /// 平台层调用：记录鼠标按钮按下。
     pub fn press_mouse(&mut self, button: MouseButton) {
         self.pressed_mouse.insert(button);
@@ -164,12 +175,13 @@ impl InputState {
         self.released_mouse.contains(&button)
     }
 
-    /// 主循环每帧结束时清理"按下沿/抬起沿"。
+    /// 主循环每帧结束时清理"按下沿/抬起沿"与鼠标位移。
     pub fn end_frame(&mut self) {
         self.pressed.clear();
         self.released.clear();
         self.pressed_mouse.clear();
         self.released_mouse.clear();
+        self.mouse_delta = mir_math::Vec2::ZERO;
     }
 
     /// 丢弃所有状态（窗口失焦时调用，避免按键卡住）。
@@ -218,5 +230,20 @@ mod tests {
         input.press(KeyCode::Space);
         input.clear();
         assert!(!input.is_down(KeyCode::Space));
+    }
+
+    #[test]
+    fn mouse_delta_accumulates_and_clears() {
+        let mut input = InputState::default();
+        input.set_mouse_delta(3.0, -2.0);
+        input.set_mouse_delta(1.0, 4.0);
+        assert_eq!(input.mouse_delta(), mir_math::Vec2::new(4.0, 2.0));
+
+        input.end_frame();
+        assert_eq!(input.mouse_delta(), mir_math::Vec2::ZERO);
+
+        input.set_mouse_delta(5.0, 5.0);
+        input.clear();
+        assert_eq!(input.mouse_delta(), mir_math::Vec2::ZERO);
     }
 }
