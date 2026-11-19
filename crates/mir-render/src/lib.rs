@@ -30,6 +30,8 @@ pub enum RenderInitError {
     Swapchain(String),
     #[error("Vulkan frame resources initialization failed: {0}")]
     FrameResources(String),
+    #[error("Vulkan depth resources initialization failed: {0}")]
+    Depth(String),
     #[error("renderer is already initialized")]
     AlreadyInitialized,
 }
