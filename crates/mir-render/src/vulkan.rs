@@ -27,8 +27,16 @@ struct FrameResources {
     extent: vk::Extent2D,
 }
 
-/// Vulkan 核心对象。按 frame → image views → swapchain → surface → device → instance 的逆序销毁。
+struct PipelineResources {
+    vertex_module: vk::ShaderModule,
+    fragment_module: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+/// Vulkan 核心对象。按 pipeline → frame → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
+    pipeline: Option<PipelineResources>,
     frame: Option<FrameResources>,
     image_views: Vec<vk::ImageView>,
     swapchain: Option<vk::SwapchainKHR>,
@@ -67,6 +75,8 @@ impl VulkanCore {
         let mut core = Self::create(Some(display), Some(window), width, height)?;
         core.create_swapchain(width, height)?;
         core.init_frame_resources()
+            .map_err(RenderInitError::FrameResources)?;
+        core.init_pipeline()
             .map_err(RenderInitError::FrameResources)?;
         Ok(core)
     }
@@ -263,6 +273,7 @@ impl VulkanCore {
         };
 
         Ok(Self {
+            pipeline: None,
             frame: None,
             image_views: Vec::new(),
             swapchain: None,
@@ -422,7 +433,133 @@ impl VulkanCore {
         Ok(())
     }
 
-    /// 录制一帧：清屏 → 提交 → 呈现。无交换链时为空操作（headless）。
+    fn init_pipeline(&mut self) -> Result<(), String> {
+        const VERTEX_CODE: &[u32] =
+            vulkanalia::include_shader_code!("../../../shaders/hello/triangle.vert.spv");
+        const FRAGMENT_CODE: &[u32] =
+            vulkanalia::include_shader_code!("../../../shaders/hello/triangle.frag.spv");
+
+        let vertex_info = vk::ShaderModuleCreateInfo::builder()
+            .code_size(VERTEX_CODE.len() * 4)
+            .code(VERTEX_CODE);
+        // SAFETY: VERTEX_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
+        let vertex_module = unsafe { self.device.create_shader_module(&vertex_info, None) }
+            .map_err(|error| format!("创建顶点着色器模块失败: {error}"))?;
+        let fragment_info = vk::ShaderModuleCreateInfo::builder()
+            .code_size(FRAGMENT_CODE.len() * 4)
+            .code(FRAGMENT_CODE);
+        // SAFETY: FRAGMENT_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
+        let fragment_module = unsafe { self.device.create_shader_module(&fragment_info, None) }
+            .map_err(|error| format!("创建片元着色器模块失败: {error}"))?;
+
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module)
+                .name(b"main\0")
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module)
+                .name(b"main\0")
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false)
+            .build();
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::_1)
+            .build();
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .blend_enable(false)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build();
+        let attachments = [blend_attachment];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            .attachments(&attachments)
+            .build();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+
+        let layout_info = vk::PipelineLayoutCreateInfo::builder().build();
+        // SAFETY: layout_info 有效且无描述符集。
+        let layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
+            .map_err(|error| format!("创建管线布局失败: {error}"))?;
+
+        let format = self
+            .format_value
+            .ok_or_else(|| "缺少 surface 格式".to_string())?;
+        let formats = [format.format];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::builder()
+            .color_attachment_formats(&formats)
+            .build();
+        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering_info)
+            .build();
+        // SAFETY: 所有状态结构与着色器模块均有效；使用动态渲染无需 render pass。
+        let pipelines = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+        }
+        .map_err(|error| format!("创建图形管线失败: {error:?}"))?
+        .0;
+        let pipeline = pipelines
+            .into_iter()
+            .next()
+            .ok_or_else(|| "图形管线创建结果为空".to_string())?;
+
+        self.pipeline = Some(PipelineResources {
+            vertex_module,
+            fragment_module,
+            layout,
+            pipeline,
+        });
+        Ok(())
+    }
+
+    fn destroy_pipeline(&mut self) {
+        if let Some(resources) = self.pipeline.take() {
+            // SAFETY: 这些对象由本对象创建且尚未销毁。
+            unsafe {
+                self.device.destroy_pipeline(resources.pipeline, None);
+                self.device.destroy_pipeline_layout(resources.layout, None);
+                self.device
+                    .destroy_shader_module(resources.fragment_module, None);
+                self.device
+                    .destroy_shader_module(resources.vertex_module, None);
+            }
+        }
+    }
+
+    /// 录制一帧：清屏 → 绘制三角形 → 提交 → 呈现。无交换链时为空操作（headless）。
     pub(super) fn render_frame(&mut self, clear_color: [f32; 4]) -> Result<(), String> {
         let swapchain = match self.swapchain {
             Some(swapchain) => swapchain,
@@ -479,6 +616,28 @@ impl VulkanCore {
                 .color_attachments(&attachments);
             self.device
                 .cmd_begin_rendering(frame.command_buffer, &rendering_info);
+            if let Some(resources) = &self.pipeline {
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: frame.extent.width as f32,
+                    height: frame.extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let viewports = [viewport];
+                let scissors = [render_area];
+                self.device
+                    .cmd_set_viewport(frame.command_buffer, 0, &viewports);
+                self.device
+                    .cmd_set_scissor(frame.command_buffer, 0, &scissors);
+                self.device.cmd_bind_pipeline(
+                    frame.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    resources.pipeline,
+                );
+                self.device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+            }
             self.device.cmd_end_rendering(frame.command_buffer);
             self.device
                 .end_command_buffer(frame.command_buffer)
@@ -528,8 +687,13 @@ impl VulkanCore {
             // SAFETY: swapchain 由本对象创建且设备已空闲。
             unsafe { self.device.destroy_swapchain_khr(swapchain, None) };
         }
+        let old_format = self.format_value;
         self.create_swapchain(width.max(1), height.max(1))
             .map_err(|error| error.to_string())?;
+        if self.format_value != old_format {
+            self.destroy_pipeline();
+            self.init_pipeline()?;
+        }
         if let Some(frame) = self.frame.as_mut() {
             frame.extent = self.extent;
         }
@@ -541,6 +705,7 @@ impl Drop for VulkanCore {
     fn drop(&mut self) {
         // SAFETY: 本对象仍持有有效的 Vulkan 句柄；按 frame → image views → swapchain → surface → device → instance 逆序释放。
         unsafe {
+            self.destroy_pipeline();
             if let Some(frame) = self.frame.take() {
                 let _ = self.device.device_wait_idle();
                 self.device.destroy_semaphore(frame.render_finished, None);

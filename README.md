@@ -468,7 +468,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染清屏与 present | 🟡 原型 | RenderGraph/几何绘制、验证层与多帧在飞行（M2） |
+| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染、GLSL/SPIR-V 管线与三角形绘制 | 🟡 原型 | RenderGraph、网格/材质、验证层与多帧在飞行（M2） |
 | `mir-window` | winit 0.30 窗口与事件循环，实现 `HasWindowHandle`/`HasDisplayHandle`，窗口创建回调 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M1/M2） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
@@ -1028,14 +1028,17 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] **M2 第三阶段**：`mir-render` 用 Vulkan 1.3 动态渲染完成每帧清屏，并经命令缓冲提交、`acquire →
       present` 真正呈现到窗口；单帧在飞行（fence + 双 semaphore）同步，窗口缩放时重建交换链。
       `frame_error()` 暴露帧级错误，示例应用退出时输出；`cargo run -- --frames 60` 无渲染错误。
+- [x] **M2 第四阶段（v0.1 Hello GPU）**：`shaders/hello/triangle.{vert,frag}` GLSL 源与校验过的 SPIR-V
+      落盘；`mir-render` 创建着色器模块与动态渲染图形管线，用 `gl_VertexIndex` 绘制彩色三角形
+      （无顶点缓冲）。交换链格式变化时重建管线；`cargo run -- --frames 60` 无渲染错误。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已能清屏并 present，但当前只有清屏色、单帧在飞行：尚未绘制三角形/网格、
-   尚无 RenderGraph、深度与多帧在飞行；验证层未启用（M2 剩余范围）。
+3. `mir-render` 已能清屏并绘制 `gl_VertexIndex` 三角形，但尚无网格/材质、RenderGraph、深度测试、
+   多帧在飞行；验证层未启用，着色器目前通过 Vulkan SDK 离线编译而非运行时 shaderc（M2 剩余范围）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
@@ -1063,6 +1066,11 @@ cargo run -- --headless --frames 1000
 
 # Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
 cargo run -p mir-vulkan-probe
+
+# 修改 shaders/hello/*.vert|frag 后，重新编译 SPIR-V（需 Vulkan SDK）
+glslangValidator -V shaders/hello/triangle.vert -o shaders/hello/triangle.vert.spv
+glslangValidator -V shaders/hello/triangle.frag -o shaders/hello/triangle.frag.spv
+spirv-val shaders/hello/triangle.vert.spv
 ```
 
 `cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
