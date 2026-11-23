@@ -19,6 +19,8 @@ pub struct EngineConfig {
     pub target_fps: u32,
     /// 最大运行帧数（`None` 表示不限；用于 headless 测试与演示自动退出）
     pub max_frames: Option<u64>,
+    /// Vulkan 校验层开关；debug 默认开启，单元测试默认关闭以避免噪音。
+    pub validation: bool,
 }
 
 impl Default for EngineConfig {
@@ -29,6 +31,7 @@ impl Default for EngineConfig {
             height: 720,
             target_fps: 60,
             max_frames: None,
+            validation: cfg!(debug_assertions) && !cfg!(test),
         }
     }
 }
@@ -104,7 +107,8 @@ fn make_context(config: &EngineConfig) -> EngineContext {
     EngineContext {
         time: Time::new(),
         input: mir_input::InputState::default(),
-        renderer: mir_render::RenderContext::new(config.width, config.height),
+        renderer: mir_render::RenderContext::new(config.width, config.height)
+            .with_validation(config.validation),
         assets: mir_asset::AssetServer::new(),
         stats: FrameStats::default(),
         cursor_capture_request: None,
@@ -184,6 +188,8 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
+        // 进程内只安装一次；之后渲染校验层与引擎日志都通过同一后端输出。
+        mir_log::init(mir_log::Level::Info);
         Self { config }
     }
 
@@ -248,6 +254,14 @@ mod tests {
         fn on_exit(&mut self, _ctx: &mut EngineContext) {
             self.exited = true;
         }
+    }
+
+    #[test]
+    fn validation_default_follows_build_profile() {
+        assert_eq!(
+            EngineConfig::default().validation,
+            cfg!(debug_assertions) && !cfg!(test)
+        );
     }
 
     #[test]

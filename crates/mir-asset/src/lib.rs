@@ -52,13 +52,13 @@ impl AssetServer {
         // 简化处理：同类型下按路径字符串哈希做去重
         let key = path.as_ref().to_string_lossy().into_owned();
         let id = hash_id(&key, self.next_id);
-        if !type_cache.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = type_cache.entry(id) {
             let full = self.root.join(path);
             let asset = T::load(&full).unwrap_or_else(|e| {
                 panic!("加载资源失败 {}: {e}", full.display());
             });
             self.next_id += 1;
-            type_cache.insert(id, Box::new(asset));
+            entry.insert(Box::new(asset));
         }
         Handle::new(id)
     }

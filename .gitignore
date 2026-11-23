@@ -6,3 +6,4 @@ managed/**/obj/
 *.user
 .vs/
 .idea/
+.codebuddy/

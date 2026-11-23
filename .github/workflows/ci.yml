@@ -31,7 +31,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --exit-code -- shaders/hello/*.spv
+          slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -50,7 +54,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test workspace
         run: cargo test --workspace
@@ -82,7 +86,9 @@ jobs:
         run: |
           slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
           slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
-          git diff --exit-code -- shaders/hello/*.spv
+          slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
+          slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
+          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

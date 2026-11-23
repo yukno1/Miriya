@@ -20,6 +20,11 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 use vulkan::VulkanCore;
 
+/// 校验层默认策略：debug 构建开启，单元测试关闭以避免噪音。
+fn default_validation() -> bool {
+    cfg!(debug_assertions) && !cfg!(test)
+}
+
 /// 渲染初始化失败。仅用于诊断；`RenderContext::init` 会记录失败并继续以占位模式运行。
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum RenderInitError {
@@ -81,6 +86,7 @@ pub struct RenderContext {
     camera: CameraFrame,
     draws: Vec<frame::DrawInstance>,
     frame_error: Option<String>,
+    validation: bool,
 }
 
 impl RenderContext {
@@ -97,7 +103,19 @@ impl RenderContext {
             camera: CameraFrame::default(),
             draws: Vec::new(),
             frame_error: None,
+            validation: default_validation(),
         }
+    }
+
+    /// 覆盖校验层开关；需在 `init` / `init_with_window` 之前调用。
+    pub fn with_validation(mut self, enabled: bool) -> Self {
+        self.validation = enabled;
+        self
+    }
+
+    /// 当前校验层配置（实际是否启用取决于驱动是否提供 layer）。
+    pub fn validation(&self) -> bool {
+        self.validation
     }
 
     /// 以 headless 方式初始化：尝试创建 Vulkan 实例与逻辑设备，但不创建 surface。
@@ -107,7 +125,7 @@ impl RenderContext {
         if self.initialized {
             return;
         }
-        match VulkanCore::new_headless() {
+        match VulkanCore::new_headless(self.validation) {
             Ok(backend) => {
                 self.status = RendererStatus::Vulkan {
                     device_name: backend.device_name().to_string(),
@@ -140,7 +158,7 @@ impl RenderContext {
         if self.initialized {
             return Err(RenderInitError::AlreadyInitialized);
         }
-        match VulkanCore::with_surface(display, window, self.width, self.height) {
+        match VulkanCore::with_surface(display, window, self.width, self.height, self.validation) {
             Ok(backend) => {
                 self.status = RendererStatus::Vulkan {
                     device_name: backend.device_name().to_string(),
@@ -275,6 +293,16 @@ mod tests {
         assert_eq!(context.status(), &RendererStatus::Uninitialized);
         assert_eq!(context.size(), (1280, 720));
         assert!(!context.exit_requested);
+    }
+
+    #[test]
+    fn validation_setting_defaults_off_in_unit_tests_and_is_overridable() {
+        let context = RenderContext::new(320, 200);
+        assert_eq!(context.validation(), default_validation());
+        assert!(!context.validation());
+
+        let enabled = RenderContext::new(320, 200).with_validation(true);
+        assert!(enabled.validation());
     }
 
     #[test]

@@ -664,6 +664,7 @@ version = "0.1.0"
 dependencies = [
  "mir-asset",
  "mir-input",
+ "mir-log",
  "mir-math",
  "mir-render",
  "mir-window",
@@ -767,6 +768,7 @@ version = "0.1.0"
 name = "mir-render"
 version = "0.1.0"
 dependencies = [
+ "mir-log",
  "mir-math",
  "raw-window-handle",
  "thiserror 2.0.21",

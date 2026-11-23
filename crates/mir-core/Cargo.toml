@@ -7,6 +7,7 @@ description = "Miriya engine core loop and lifecycle"
 [dependencies]
 mir-asset = { path = "../mir-asset" }
 mir-input = { path = "../mir-input" }
+mir-log = { path = "../mir-log" }
 mir-math = { path = "../mir-math" }
 mir-render = { path = "../mir-render" }
 mir-window = { path = "../mir-window" }

@@ -1,5 +1,9 @@
 //! 场景子系统：游戏对象的组织与管理。
 
+mod camera;
+
+pub use camera::{Camera, CameraController, CameraInput};
+
 use mir_ecs::World;
 use mir_math::{Mat4, Quat, Vec3};
 

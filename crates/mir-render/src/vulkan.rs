@@ -2,14 +2,14 @@
 //!
 //! 本模块是 crate 私有的；Vulkan 类型不得出现在 `mir-render` 的公共 API 中。
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::vk::{
-    DeviceV1_3, InstanceV1_1, KhrSurfaceExtensionInstanceCommands,
-    KhrSwapchainExtensionDeviceCommands,
+    DeviceV1_3, EntryV1_0, ExtDebugUtilsExtensionInstanceCommands, InstanceV1_1,
+    KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands,
 };
 use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
@@ -20,6 +20,112 @@ use crate::mesh::{MeshData, MeshHandle, Vertex, indices_as_bytes, vertices_as_by
 use mir_math::Mat4;
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
+const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+/// 查询 loader 是否提供 Khronos 校验层；缺失时调用方降级关闭而不是报错。
+fn validation_layer_available(entry: &Entry) -> bool {
+    // SAFETY: `entry` 由当前进程加载的 Vulkan loader 构造，查询不依赖实例。
+    unsafe { entry.enumerate_instance_layer_properties() }
+        .map(|layers| {
+            layers
+                .iter()
+                .any(|layer| layer.layer_name.as_cstr() == VALIDATION_LAYER)
+        })
+        .unwrap_or(false)
+}
+
+/// debug utils 回调信息：错误/警告记入 `mir-log`，并带上类型、ID 与对象名。
+fn debug_messenger_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT {
+    vk::DebugUtilsMessengerCreateInfoEXT::builder()
+        .message_severity(
+            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+        )
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .user_callback(Some(debug_callback))
+        .build()
+}
+
+/// 安全读取校验层回调中的 C 字符串；调用方需保证指针有效或以空指针表示缺省。
+unsafe fn debug_cstr(ptr: *const c_char, fallback: &str) -> String {
+    if ptr.is_null() {
+        fallback.to_string()
+    } else {
+        // SAFETY: 调用方保证 `ptr` 为空指针或有效的 NUL 结尾字符串。
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+unsafe extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_types: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _user_data: *mut c_void,
+) -> vk::Bool32 {
+    if data.is_null() {
+        return vk::FALSE;
+    }
+    // SAFETY: 回调数据由 Vulkan 校验层提供，调用期间有效。
+    let data = unsafe { &*data };
+    let id = unsafe { debug_cstr(data.message_id_name, "unknown") };
+    let message = unsafe { debug_cstr(data.message, "") };
+    let mut object_names = Vec::new();
+    if !data.objects.is_null() && data.object_count > 0 {
+        // SAFETY: `object_count` 与 `objects` 由校验层保证一致且调用期间有效。
+        let objects =
+            unsafe { std::slice::from_raw_parts(data.objects, data.object_count as usize) };
+        for object in objects.iter().take(4) {
+            let name = unsafe { debug_cstr(object.object_name, "unnamed") };
+            object_names.push(format!(
+                "{:?}:{}:{}",
+                object.object_type, object.object_handle, name
+            ));
+        }
+        if data.object_count > 4 {
+            object_names.push(format!("+{}", data.object_count - 4));
+        }
+    }
+    let objects = if object_names.is_empty() {
+        "-".to_string()
+    } else {
+        object_names.join(", ")
+    };
+    let payload = format!("[{message_types:?}/{id}] objects=[{objects}] {message}");
+
+    if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        mir_log::error!(target: "vulkan", "{payload}");
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        mir_log::warn!(target: "vulkan", "{payload}");
+    } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+        mir_log::info!(target: "vulkan", "{payload}");
+    } else {
+        mir_log::debug!(target: "vulkan", "{payload}");
+    }
+
+    // 返回 FALSE：校验层不应因为日志而中止 Vulkan 调用。
+    vk::FALSE
+}
+
+fn create_debug_messenger(instance: &Instance) -> Option<vk::DebugUtilsMessengerEXT> {
+    let create_info = debug_messenger_create_info();
+    // SAFETY: instance 有效且创建时启用了 VK_EXT_debug_utils；回调为 `extern "system"` 且不逃逸数据。
+    match unsafe { instance.create_debug_utils_messenger_ext(&create_info, None) } {
+        Ok(messenger) => {
+            mir_log::info!(target: "vulkan", "校验层已启用");
+            Some(messenger)
+        }
+        Err(error) => {
+            mir_log::warn!(target: "vulkan", "debug utils messenger 创建失败，校验层不可用：{error}");
+            None
+        }
+    }
+}
 
 /// 单帧录制与同步资源（当前只保留一帧在飞行，简化 CPU/GPU 同步）。
 struct FrameResources {
@@ -27,7 +133,7 @@ struct FrameResources {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     image_available: vk::Semaphore,
-    /// 每张交换链图像一个呈现信号量：避免同一信号量在“已呈现但尚未重新 acquire”的图像间复用。
+    /// 每张交换链图像一个呈现信号量：避免同一信号量在"已呈现但尚未重新 acquire"的图像间复用。
     render_finished: Vec<vk::Semaphore>,
     extent: vk::Extent2D,
 }
@@ -106,6 +212,8 @@ pub(super) struct VulkanCore {
     surface: Option<vk::SurfaceKHR>,
     device: Device,
     instance: Instance,
+    /// 校验层 debug messenger；必须在 instance 之前销毁。
+    debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     // Entry 持有加载器；必须比 Instance / Device 活得更久。
     _entry: Entry,
     physical_device: vk::PhysicalDevice,
@@ -129,8 +237,8 @@ pub(super) struct VulkanCore {
 
 impl VulkanCore {
     /// 无窗口（headless）初始化：不创建 surface，不启用交换链扩展。
-    pub(super) fn new_headless() -> Result<Self, RenderInitError> {
-        Self::create(None, None, 0, 0)
+    pub(super) fn new_headless(validation: bool) -> Result<Self, RenderInitError> {
+        Self::create(None, None, 0, 0, validation)
     }
 
     /// 带窗口初始化：创建 surface 与交换链，并要求物理设备支持呈现。
@@ -139,8 +247,9 @@ impl VulkanCore {
         window: &dyn HasWindowHandle,
         width: u32,
         height: u32,
+        validation: bool,
     ) -> Result<Self, RenderInitError> {
-        let mut core = Self::create(Some(display), Some(window), width, height)?;
+        let mut core = Self::create(Some(display), Some(window), width, height, validation)?;
         core.create_swapchain(width, height)?;
         core.init_frame_resources()
             .map_err(RenderInitError::FrameResources)?;
@@ -184,6 +293,7 @@ impl VulkanCore {
         window: Option<&dyn HasWindowHandle>,
         _width: u32,
         _height: u32,
+        validation: bool,
     ) -> Result<Self, RenderInitError> {
         // SAFETY: 从系统路径加载标准 Vulkan loader；返回的 Entry 在本函数返回后由 VulkanCore 持有。
         let loader = unsafe { LibloadingLoader::new(LIBRARY) }
@@ -192,12 +302,28 @@ impl VulkanCore {
         let entry = unsafe { Entry::new(loader) }
             .map_err(|error| RenderInitError::Loader(error.to_string()))?;
 
-        let required_extensions: Vec<*const c_char> = match window {
+        let validation_enabled = validation && validation_layer_available(&entry);
+        if validation && !validation_enabled {
+            mir_log::warn!(
+                target: "vulkan",
+                "未找到 VK_LAYER_KHRONOS_validation，校验层已关闭"
+            );
+        }
+
+        let mut required_extensions: Vec<*const c_char> = match window {
             Some(window) => vulkan_window::get_required_instance_extensions(window)
                 .iter()
                 .map(|extension| extension.as_ptr())
                 .collect(),
             None => Vec::new(),
+        };
+        if validation_enabled {
+            required_extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION.name.as_ptr());
+        }
+        let enabled_layers: Vec<*const c_char> = if validation_enabled {
+            vec![VALIDATION_LAYER.as_ptr()]
+        } else {
+            Vec::new()
         };
 
         let app_info = vk::ApplicationInfo::builder()
@@ -209,10 +335,17 @@ impl VulkanCore {
             .build();
         let instance_info = vk::InstanceCreateInfo::builder()
             .application_info(&app_info)
-            .enabled_extension_names(&required_extensions);
-        // SAFETY: app_info / instance_info / required_extensions 在调用期间有效，入口为有效 Vulkan 实例入口。
+            .enabled_extension_names(&required_extensions)
+            .enabled_layer_names(&enabled_layers);
+        // SAFETY: app_info / instance_info / required_extensions / enabled_layers 在调用期间有效，
+        // 入口为有效 Vulkan 实例入口；校验层与扩展均已通过 loader 查询。
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(|error| RenderInitError::Instance(error.to_string()))?;
+        let debug_messenger = if validation_enabled {
+            create_debug_messenger(&instance)
+        } else {
+            None
+        };
 
         let surface = match (display, window) {
             (Some(display), Some(window)) => {
@@ -403,6 +536,7 @@ impl VulkanCore {
             surface,
             device,
             instance,
+            debug_messenger,
             _entry: entry,
             physical_device,
             graphics_queue,
@@ -1076,7 +1210,7 @@ impl VulkanCore {
             .viewport_count(1)
             .scissor_count(1)
             .build();
-        // 模型空间绕序为“从外部看逆时针”；Vulkan NDC 为 Y 向下，投影后按顺时针判定正面。
+        // 模型空间绕序为"从外部看逆时针"；Vulkan NDC 为 Y 向下，投影后按顺时针判定正面。
         let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
@@ -1159,13 +1293,16 @@ impl VulkanCore {
             .offset(0)
             .range(CAMERA_UBO_SIZE)
             .build();
+        // 必须命名中间数组：`WriteDescriptorSet` 保存的是指针，临时数组会在语句结束即失效
+        // （debug 构建侥幸可用，release 优化后会读到已经被覆盖的栈内存）。
+        let buffer_infos = [buffer_info];
         let writes = [vk::WriteDescriptorSet::builder()
             .dst_set(descriptor_set)
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&[buffer_info])
+            .buffer_info(&buffer_infos)
             .build()];
-        // SAFETY: 描述符集有效，buffer_info 在调用期间有效。
+        // SAFETY: 描述符集有效，buffer_infos 在调用期间有效。
         unsafe {
             let no_copies: [vk::CopyDescriptorSet; 0] = [];
             self.device.update_descriptor_sets(&writes, &no_copies);
@@ -1240,7 +1377,8 @@ impl VulkanCore {
             unsafe {
                 self.device.destroy_pipeline(resources.pipeline, None);
                 self.device.destroy_pipeline_layout(resources.layout, None);
-                self.device.destroy_descriptor_pool(resources.descriptor_pool, None);
+                self.device
+                    .destroy_descriptor_pool(resources.descriptor_pool, None);
                 self.device
                     .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
                 self.device.destroy_buffer(resources.camera_buffer, None);
@@ -1343,7 +1481,7 @@ impl VulkanCore {
                 .layer_count(1)
                 .build();
 
-            // 从“未定义”转到颜色附件：本帧首操作是 CLEAR，旧内容本就要丢弃，
+            // 从"未定义"转到颜色附件：本帧首操作是 CLEAR，旧内容本就要丢弃，
             // 因此用 UNDEFINED 作 oldLayout 即可，无需跟踪每张图像的历史布局。
             let to_color_attachment = vk::ImageMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::empty())
@@ -1591,7 +1729,7 @@ impl VulkanCore {
 impl Drop for VulkanCore {
     fn drop(&mut self) {
         // SAFETY: 本对象仍持有有效的 Vulkan 句柄；先等待 GPU 空闲，再按
-        // pipeline → frame → image views → swapchain → surface → device → instance 逆序释放。
+        // pipeline → frame → image views → swapchain → surface → messenger → device → instance 逆序释放。
         unsafe {
             if let Some(frame) = self.frame.take() {
                 let _ = self.device.device_wait_idle();
@@ -1616,6 +1754,10 @@ impl Drop for VulkanCore {
             self.swapchain_images.clear();
             if let Some(surface) = self.surface.take() {
                 self.instance.destroy_surface_khr(surface, None);
+            }
+            if let Some(messenger) = self.debug_messenger.take() {
+                self.instance
+                    .destroy_debug_utils_messenger_ext(messenger, None);
             }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -1648,5 +1790,24 @@ mod tests {
     #[test]
     fn camera_ubo_size_is_64_bytes() {
         assert_eq!(CAMERA_UBO_SIZE, 64);
+    }
+
+    #[test]
+    fn validation_layer_name_is_standard() {
+        assert_eq!(VALIDATION_LAYER.to_bytes(), b"VK_LAYER_KHRONOS_validation");
+    }
+
+    #[test]
+    fn debug_messenger_subscribes_to_errors_and_warnings() {
+        let info = debug_messenger_create_info();
+        assert!(info.message_severity.contains(
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+        ));
+        assert!(
+            info.message_type
+                .contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION)
+        );
+        assert!(info.user_callback.is_some());
     }
 }

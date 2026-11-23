@@ -8,7 +8,7 @@
 | 项目信息 | 说明 |
 |---|---|
 | 上游基线 | Unreal Engine **5.8.4**（同机目录 `../UnrealEngine`，仅作行为参考） |
-| 当前阶段 | **M0 · 工程基线收敛**（脚手架已存在，尚未收敛） |
+| 当前阶段 | **M2 · v0.2 Cube 已达成**（渲染 v0 剩余工作仍在进行） |
 | 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
 | 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
 | 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
@@ -464,14 +464,14 @@ Miriya/
 
 | crate | 现状 | 成熟度 | 下一步（里程碑） |
 |---|---|---|---|
-| `mir-core` | `EngineConfig`/`AppState`/`EngineContext`/`Engine` 主循环，帧率限制 | 🟡 原型 | 拆 `EngineLoop`/`FramePipeline`、插件与退出资源（M0–M1） |
+| `mir-core` | `EngineConfig`（含 `validation`）/主循环、帧率限制、日志初始化 | 🟡 原型 | 拆 `EngineLoop`/`FramePipeline`、插件与退出资源（M2–M3） |
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
-| `mir-input` | 键鼠集合，6 个可用键位（另有 `Unknown`），无事件源 | 🟡 原型 | winit 接入、Action 映射、手柄（M1/M7） |
-| `mir-render` | `vulkanalia` 实例/设备/队列、surface、交换链、动态渲染、Slang/SPIR-V 管线与三角形绘制 | 🟡 原型 | RenderGraph、网格/材质、验证层与多帧在飞行（M2） |
-| `mir-window` | winit 0.30 窗口与事件循环，实现 `HasWindowHandle`/`HasDisplayHandle`，窗口创建回调 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M1/M2） |
+| `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
+| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants/10 实例绘制、校验层与日志桥接 | 🟡 原型 | RenderGraph、材质/PBR、多帧在飞行、显存子分配器（M2 剩余/M5） |
+| `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
-| `mir-scene` | `Scene` + `Transform` | 🟡 原型 | Level/Actor/层级/组件（M3） |
+| `mir-scene` | `Scene`、`Transform`（含旋转/TRS）、UI 无关的自由相机与控制器 | 🟡 原型 | Level/Actor/层级/组件（M3） |
 | `mir-log` | 全局 logger、五级宏、控制台输出、含单元测试，纯 std | ✅ 可用 | `tracing` 桥接、文件/异步 writer（M1） |
 | `mir-physics` | `PhysicsBackend` 契约、世代句柄、`FixedStep`、查询/接触事件/调试数据、`NullPhysicsBackend`、可复用契约测试；无求解器 | 🟡 契约 | 引擎侧胶水与外部后端接入（M6） |
 | `mir-editor-core` | UI 无关的文档/选择/类型化命令与撤销栈/Inspector 字段描述/视口数学/PIE 状态机，headless 测试 | 🟡 契约 | 完整编辑器核心与 UI 后端 spike（M12） |
@@ -646,6 +646,8 @@ Miriya/
 
 - **后端**：Vulkan 1.3，通过 **`vulkanalia`**。`mir-render` 内部负责实例、物理设备选择、队列、交换链、
   描述符池/布局、管线、显存、命令缓冲与同步；公共 API 不出现 Vulkan 类型。
+- **帧数据边界（ADR-0012）**：应用层提取 `CameraFrame` / `InstanceData` 后提交，`mir-render` 不依赖场景或 ECS；
+  相机放 UBO、逐实例数据放 push constants。v0.2 仍是单帧在飞行，多帧/子分配器为 M2 剩余。
 - **特性**：动态渲染（dynamic rendering）、synchronization2、timeline semaphore、descriptor indexing；
   调试构建启用 Khronos validation layer；发布版持久化 pipeline cache 降低首帧卡顿。
 - **帧结构**：2–3 帧在飞行、环形暂存缓冲、**自研显存子分配器**（块/池/延迟回收，基于 `vulkanalia` 的显存类型，
@@ -1014,7 +1016,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   方向键/修饰键；`mir-input` 补全鼠标按键沿与失焦清理；窗口关闭、Esc、`max_frames` 均可退出主循环。
 - [x] 帧统计 `FrameStats`（帧数、平滑 FPS、帧耗时）接入 `EngineContext`；`Engine::run_headless` 支持
   无窗口跑帧，新增 `headless_1000_frames` 测试。
-- [x] M0 遗留：`vulkanalia` PoC 全链路实测通过（RFC 0001），首批 10 篇 ADR 落盘 `docs/adr/`。
+- [x] M0 遗留：`vulkanalia` PoC 全链路实测通过（RFC 0001），ADR 0001–0012 已落盘 `docs/adr/`。
 - [x] **M0 契约起草**：`mir-physics` 落地 `PhysicsBackend` 契约、`BodyId`/`ColliderId` 世代句柄、
       `FixedStep`、射线/扫掠/重叠/接触事件/调试绘制数据、`NullPhysicsBackend` 与可复用的
       `assert_backend_contract`；`mir-editor-core` 落地 UI 无关的关卡文档/选择/类型化命令与撤销栈/
@@ -1033,24 +1035,35 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] **M2 第四阶段（v0.1 Hello GPU）**：`shaders/hello/triangle.slang` 单文件包含顶点/片元入口，
       经 Slang 编译与 `spirv-val` 校验的 SPIR-V 落盘；`mir-render` 创建着色器模块与动态渲染图形管线，
       用 `SV_VertexID` 绘制彩色三角形（无顶点缓冲）。交换链格式变化时重建管线；`cargo run -- --frames 60` 无渲染错误。
+- [x] **M2 第五阶段（v0.2 Cube 达成）**：深度缓冲、交换链 layout/失效恢复、staging 网格上传与世代句柄、
+  `shaders/cube/cube.slang`（UBO + push constants）、逐实例绘制 API 已落地；演示场景为 3×3 阵列 + 中心自转，
+  共 10 个实例。
+- [x] **自由相机与输入**：`mir-scene::{Camera, CameraController}` + WASD/QE/Shift + 右键鼠标视角；
+  `--width` / `--height` / `--validation` / `--no-validation` 可用，失焦自动释放光标。
+- [x] **校验层代码内接入**：`EngineConfig::validation` 控制 layer 探测、`VK_EXT_debug_utils` messenger 与 `mir-log`
+  桥接；layer 缺失时警告降级。release 构建曾暴露 `WriteDescriptorSet` 临时数组悬垂指针，已修复并纳入
+  `docs/plans/v0.2-cube.md` §10。
+- [x] **ADR-0012 与 CI**：记录 extract 边界、UBO/push constants 划分、单帧在飞行取舍与演示单位偏差；
+  CI 两个 job 均重新生成并校验 `shaders/hello/*.spv`、`shaders/cube/*.spv`；Clippy 收紧为 `-D warnings`。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已能清屏并绘制 `SV_VertexID` 三角形，但尚无网格/材质、RenderGraph、深度测试、
-   多帧在飞行；验证层未启用，着色器目前通过 `slangc` 离线编译而非运行时编译；当前按阶段输出两个 `.spv`，
-   单 `.spv` 多入口随 RenderGraph 重构处理（均为 M2 剩余范围）。
+3. `mir-render` 已具备深度、网格、逐实例绘制与校验层，但尚无材质/PBR、RenderGraph、多帧在飞行、
+   自研显存子分配器与视锥剔除；继续按阶段输出两个 `.spv`，单 `.spv` 多入口随 RenderGraph 重构处理（M2 剩余/M5）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
-5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
+5. Git 仓库已初始化且已推送到 `origin/main`；本地工作区需随每次里程碑同步提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
-7. `vulkanalia` 已从 PoC（RFC 0001）引入 `mir-render`；.NET 11 宿主仍未接入；
+7. `vulkanalia` 已接入 `mir-render` 且校验层可用；.NET 11 宿主仍未接入；
    `mir-script`、`mir-bindgen`、`managed/` 仍为空壳，需 M8 落地。
 8. 当前没有物理求解器（这是新约束）：`mir-physics` 已提供可编译的契约骨架与 `NullPhysicsBackend`，
    但求解器仍须由外部自研后端提供；引擎侧固定步/句柄表/坐标转换胶水留待 M6，v0.4 起需接入外部后端。
 9. 编辑器 UI 后端尚未选定：`mir-editor-core` 已有 UI 无关契约骨架（headless 测试通过），
    `mir-editor-ui`/`mir-editor-gpui`/`mir-editor-egui` 仍为空壳；GPUI/egui 需在 M12 前完成 spike 与 ADR-0009。
+10. Vulkan builder 只保存切片指针，临时数组在 release 下可能失效；本次已修复一处，后续 unsafe 审查需持续检查
+    同类模式，并把 release + 校验层运行纳入重要渲染改动的验收。
 
 ### 14.3 快速开始
 
@@ -1059,49 +1072,48 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 cargo check --workspace
 cargo test --workspace
 
-# 运行示例（打开真实窗口；Esc 或点击关闭按钮退出，也可 --frames N 自动退出）
+# 运行示例（3×3 立方体 + 中心自转，10 实例；WASD/QE 移动、右键拖动视角、Esc 退出）
 # workspace 已设置 default-members，根目录直接 cargo run 即可
 cargo run
-cargo run -- --frames 120
+cargo run -- --frames 600 --width 1920 --height 1080
+cargo run --release -- --frames 600 --width 1920 --height 1080
 
-# 无窗口跑帧（CI/headless 验证）
-cargo run -- --headless --frames 1000
+# 无窗口跑帧（CI/headless 验证）；校验层 debug 默认开启，可显式覆盖
+cargo run -- --headless --frames 1000 --no-validation
+cargo run -- --validation --frames 120
 
 # Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
 cargo run -p mir-vulkan-probe
 
-# 修改 shaders/hello/*.slang 后，重新编译 SPIR-V（需 Slang 编译器，可由 Vulkan SDK 或 Slang release 提供）
+# 修改 *.slang 后，重新编译 SPIR-V（需 Slang 编译器，可由 Vulkan SDK 或 Slang release 提供）
 slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
 slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
-spirv-val shaders/hello/triangle.vert.spv
-spirv-val shaders/hello/triangle.frag.spv
+slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
+slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
+spirv-val shaders/hello/triangle.vert.spv shaders/hello/triangle.frag.spv
+spirv-val shaders/cube/cube.vert.spv shaders/cube/cube.frag.spv
 ```
 
-`cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
-窗口由 winit 创建，关闭窗口或按 Esc 均通过 `request_exit` 退出；`Engine::run_headless` 不创建事件循环，
-用于 headless 1000 帧测试。M8 起还需要 .NET 11 SDK 编译 C# 脚本。
+`cargo check --workspace`、`cargo test --workspace`、`cargo fmt --all -- --check` 与
+`cargo clippy --workspace --all-targets -- -D warnings` 当前通过（仅 Cargo 清单有既有 unused dependency 警告）；
+窗口由 winit 创建，关闭窗口或按 Esc 均通过 `request_exit` 退出；`Engine::run_headless` 不创建事件循环。
+v0.2 Gate 结果与 release 构建中发现并修复的悬垂指针问题见 `docs/plans/v0.2-cube.md` §9/§10。
+M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 
-### 14.4 下一步（M0 任务清单）
+### 14.4 下一步（M2 剩余与后续里程碑）
 
-- [x] 子 crate 加入 workspace（已拍平，`members = ["crates/*", "tools/*"]`，41 个成员）。
-- [x] 修复门面 re-export：`miriya-engine` 已导出 `mir_log` 等 9 个原型子系统；
-      新模块接入时继续检查依赖方向。
-- [x] 添加 `rust-toolchain.toml`、`.editorconfig`。
-- [x] 添加 `LICENSE-MIT`、`LICENSE-APACHE`、`global.json`。
-- [x] CI：Windows（Slang shader 编译 + fmt/clippy/test + .NET 11 `dotnet build`）+ Linux（Slang shader 编译 + `cargo check` 接口检查）；已配置 Cargo 缓存。
-- [x] `vulkanalia` 最小 PoC（`tools/mir-vulkan-probe`）：实例/物理设备/逻辑设备/surface/交换链前置查询全链路
-      本机实测通过（Loader 1.4.341、Intel Iris Xe、Vulkan 1.3、B8G8R8A8_UNORM/IMMEDIATE），
-      风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 11 hostfxr 托管 PoC 属 M8 前置。
-- [x] 起草 `PhysicsBackend` 契约与 `mir-editor-core` 边界（UI 无关），供 M6/M12 使用：
-      两 crate 的骨架已落地并通过 `cargo test --workspace` 与 Clippy `-D warnings`；
-      `thiserror = "2"` 已纳入 `[workspace.dependencies]`。
-- [x] 建立 `docs/adr/` 目录。
-- [x] 撰写 ADR 0001–0011（布局、ECS、坐标系、渲染管线、Vulkan 单后端、C# 脚本运行时、
-      Windows-only/Linux 接口、物理后端接口、编辑器 UI 后端选型、Rust-first API/1:1 边界、着色器语言迁移到 Slang）；
-      其中 ADR-0009 为 Proposed，待 M12 spike 定稿；ADR-0004 的着色器语言部分由 ADR-0011 取代。
-- [x] 主循环可退出 + headless 测试：`max_frames` / 窗口关闭 / Esc 均可退出；`headless_1000_frames` 通过。
-- [x] M1：winit 窗口与事件循环、键鼠映射、输入快照、帧统计、退出链路（Linux CI 已装 X11/Wayland 依赖）。
-- [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）。
+- [x] M0：workspace 拍平（41 个成员）、工具链/许可/`global.json`/CI、ADR 0001–0012、
+      `vulkanalia` PoC、物理与编辑器核心契约、`max_frames` + headless 1000 帧。
+- [x] M1：winit 窗口与事件循环、键鼠映射、输入快照、鼠标增量/光标捕获、帧统计、退出链路。
+- [x] M2 / v0.2 Cube：深度、交换链健壮性、网格上传、cube 着色器与管线、10 实例提交、自由相机、
+      代码内校验层 + `mir-log` 桥接、release 悬垂指针修复、CI 双 shader 校验；详见
+      `docs/plans/v0.2-cube.md` §9/§10。
+- [ ] **M2 剩余**：RenderGraph v0.5、2–3 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存、
+      自研显存子分配器、网格/材质系统与基础 PBR（v0.3 前置）。
+- [ ] **M3**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene` 收敛到 `mir-math`
+      并按 ADR-0012 校准演示单位（米 → 厘米）。
+- [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
+- [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）；每次里程碑结束同步 §14 与 `docs/plans/`。
 
 ---
 
@@ -1164,5 +1176,5 @@ spirv-val shaders/hello/triangle.frag.spv
 
 ---
 
-> **文档维护**：Miriya 团队 · 最后更新 2026-11-19
+> **文档维护**：Miriya 团队 · 最后更新 2026-11-23
 > 本文件是**规划**，不代表上述能力已经完成；进度以 §14 为准，变更以 ADR 为准。

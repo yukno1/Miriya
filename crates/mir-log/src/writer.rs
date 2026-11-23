@@ -61,10 +61,10 @@ impl ConsoleLogger {
 
         let _ = write!(line, " {}", record.args());
 
-        if self.show_location {
-            if let (Some(file), Some(line_no)) = (record.file(), record.line()) {
-                let _ = write!(line, " ({file}:{line_no})");
-            }
+        if self.show_location
+            && let (Some(file), Some(line_no)) = (record.file(), record.line())
+        {
+            let _ = write!(line, " ({file}:{line_no})");
         }
 
         line
