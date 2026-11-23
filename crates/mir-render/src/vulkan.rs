@@ -15,7 +15,9 @@ use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
-use crate::mesh::{MeshData, MeshHandle, indices_as_bytes, vertices_as_bytes};
+use crate::frame::DrawInstance;
+use crate::mesh::{MeshData, MeshHandle, Vertex, indices_as_bytes, vertices_as_bytes};
+use mir_math::Mat4;
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
 
@@ -33,8 +35,36 @@ struct FrameResources {
 struct PipelineResources {
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    camera_buffer: vk::Buffer,
+    camera_memory: vk::DeviceMemory,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+}
+
+/// 相机 UBO（binding 0）：`view_proj`（4 × 4 f32）。
+const CAMERA_UBO_SIZE: u64 = 64;
+
+/// 逐实例 push constants：`model` + `tint`，共 80 字节（低于 128 字节下限）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PushConstants {
+    model: [f32; 16],
+    tint: [f32; 4],
+}
+
+const PUSH_CONSTANT_SIZE: u32 = 80;
+
+fn push_constant_bytes(pc: &PushConstants) -> &[u8] {
+    // SAFETY: `PushConstants` 为 repr(C) 且只含 f32，无填充，大小 80。
+    unsafe {
+        std::slice::from_raw_parts(
+            (pc as *const PushConstants).cast::<u8>(),
+            std::mem::size_of::<PushConstants>(),
+        )
+    }
 }
 
 /// 深度附件资源：单采样、静态布局（创建后即为 `DEPTH_ATTACHMENT_OPTIMAL`）。
@@ -982,9 +1012,9 @@ impl VulkanCore {
 
     fn init_pipeline(&mut self) -> Result<(), String> {
         const VERTEX_CODE: &[u32] =
-            vulkanalia::include_shader_code!("../../../shaders/hello/triangle.vert.spv");
+            vulkanalia::include_shader_code!("../../../shaders/cube/cube.vert.spv");
         const FRAGMENT_CODE: &[u32] =
-            vulkanalia::include_shader_code!("../../../shaders/hello/triangle.frag.spv");
+            vulkanalia::include_shader_code!("../../../shaders/cube/cube.frag.spv");
 
         let vertex_info = vk::ShaderModuleCreateInfo::builder()
             .code_size(VERTEX_CODE.len() * 4)
@@ -1011,7 +1041,33 @@ impl VulkanCore {
                 .name(b"main\0")
                 .build(),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+
+        // 顶点布局：位置 @0、颜色 @1，stride 24（与 `Vertex` 一致）。
+        let vertex_binding = vk::VertexInputBindingDescription::builder()
+            .binding(0)
+            .stride(Vertex::SIZE as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+            .build();
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription::builder()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0)
+                .build(),
+            vk::VertexInputAttributeDescription::builder()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(12)
+                .build(),
+        ];
+        let vertex_bindings = [vertex_binding];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes)
+            .build();
+
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false)
@@ -1020,10 +1076,11 @@ impl VulkanCore {
             .viewport_count(1)
             .scissor_count(1)
             .build();
+        // 模型空间绕序为“从外部看逆时针”；Vulkan NDC 为 Y 向下，投影后按顺时针判定正面。
         let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0)
             .build();
         let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
@@ -1054,8 +1111,76 @@ impl VulkanCore {
             .dynamic_states(&dynamic_states)
             .build();
 
-        let layout_info = vk::PipelineLayoutCreateInfo::builder().build();
-        // SAFETY: layout_info 有效且无描述符集。
+        // 描述符集 0 / binding 0：相机 UBO。
+        let ubo_binding = vk::DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+        let descriptor_bindings = [ubo_binding];
+        let descriptor_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::builder().bindings(&descriptor_bindings);
+        // SAFETY: 绑定描述有效。
+        let descriptor_set_layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&descriptor_layout_info, None)
+        }
+        .map_err(|error| format!("创建描述符布局失败: {error}"))?;
+
+        let pool_sizes = [vk::DescriptorPoolSize {
+            type_: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .pool_sizes(&pool_sizes)
+            .max_sets(1);
+        // SAFETY: 池大小与最大集合数有效。
+        let descriptor_pool = unsafe { self.device.create_descriptor_pool(&pool_info, None) }
+            .map_err(|error| format!("创建描述符池失败: {error}"))?;
+
+        let set_layouts = [descriptor_set_layout];
+        let allocate_info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: 池与布局有效，请求 1 个描述符集。
+        let descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&allocate_info) }
+            .map_err(|error| format!("分配描述符集失败: {error}"))?;
+        let descriptor_set = *descriptor_sets
+            .first()
+            .ok_or_else(|| "描述符集分配结果为空".to_string())?;
+
+        let (camera_buffer, camera_memory) = self.create_buffer(
+            CAMERA_UBO_SIZE,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let buffer_info = vk::DescriptorBufferInfo::builder()
+            .buffer(camera_buffer)
+            .offset(0)
+            .range(CAMERA_UBO_SIZE)
+            .build();
+        let writes = [vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&[buffer_info])
+            .build()];
+        // SAFETY: 描述符集有效，buffer_info 在调用期间有效。
+        unsafe {
+            let no_copies: [vk::CopyDescriptorSet; 0] = [];
+            self.device.update_descriptor_sets(&writes, &no_copies);
+        }
+
+        let push_range = vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(PUSH_CONSTANT_SIZE)
+            .build();
+        let push_ranges = [push_range];
+        let layout_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: layout_info 有效：1 个描述符集 + 80 字节 push constants。
         let layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(|error| format!("创建管线布局失败: {error}"))?;
 
@@ -1098,6 +1223,11 @@ impl VulkanCore {
         self.pipeline = Some(PipelineResources {
             vertex_module,
             fragment_module,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_set,
+            camera_buffer,
+            camera_memory,
             layout,
             pipeline,
         });
@@ -1106,10 +1236,15 @@ impl VulkanCore {
 
     fn destroy_pipeline(&mut self) {
         if let Some(resources) = self.pipeline.take() {
-            // SAFETY: 这些对象由本对象创建且尚未销毁。
+            // SAFETY: 这些对象由本对象创建且尚未销毁；调用方保证 GPU 已空闲。
             unsafe {
                 self.device.destroy_pipeline(resources.pipeline, None);
                 self.device.destroy_pipeline_layout(resources.layout, None);
+                self.device.destroy_descriptor_pool(resources.descriptor_pool, None);
+                self.device
+                    .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
+                self.device.destroy_buffer(resources.camera_buffer, None);
+                self.device.free_memory(resources.camera_memory, None);
                 self.device
                     .destroy_shader_module(resources.fragment_module, None);
                 self.device
@@ -1118,20 +1253,32 @@ impl VulkanCore {
         }
     }
 
+    /// 解析网格句柄；世代号不匹配（已被销毁/复用）时返回 `None`。
+    fn mesh_lookup(meshes: &[MeshSlot], handle: MeshHandle) -> Option<&GpuMesh> {
+        let slot = meshes.get(handle.index())?;
+        if slot.generation != handle.generation() {
+            return None;
+        }
+        slot.mesh.as_ref()
+    }
+
     /// 当前交换链尺寸是否与应用层已知的窗口尺寸不一致。
     fn target_differs(&self, width: u32, height: u32) -> bool {
         self.extent.width != width || self.extent.height != height
     }
 
-    /// 录制一帧：清屏 → 绘制三角形 → 提交 → 呈现。无交换链时为空操作（headless）。
+    /// 录制一帧：清屏 → 逐实例绘制 → 提交 → 呈现。无交换链时为空操作（headless）。
     ///
     /// 交换链失效（`OUT_OF_DATE`）不视为帧错误：标记后本帧跳过，下一帧开头按当前窗口尺寸重建。
-    /// `width` / `height` 是应用层已知的窗口尺寸，用于重建时取最新目标大小。
+    /// `width` / `height` 是应用层已知的窗口尺寸，用于重建时取最新目标大小；
+    /// `view_proj` 是本帧相机，`draws` 是应用层提交的实例列表。
     pub(super) fn render_frame(
         &mut self,
         clear_color: [f32; 4],
         width: u32,
         height: u32,
+        view_proj: Mat4,
+        draws: &[DrawInstance],
     ) -> Result<(), String> {
         if self.surface.is_none() {
             return Ok(());
@@ -1277,7 +1424,69 @@ impl VulkanCore {
                     vk::PipelineBindPoint::GRAPHICS,
                     resources.pipeline,
                 );
-                self.device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+
+                // 相机 UBO：单帧在飞行，写完即用（HOST_VISIBLE|COHERENT）。
+                let camera_matrix = view_proj.to_cols_array();
+                let mapped = self.device.map_memory(
+                    resources.camera_memory,
+                    0,
+                    CAMERA_UBO_SIZE,
+                    vk::MemoryMapFlags::empty(),
+                );
+                if let Ok(mapped) = mapped {
+                    std::ptr::copy_nonoverlapping(
+                        camera_matrix.as_ptr().cast::<u8>(),
+                        mapped.cast::<u8>(),
+                        CAMERA_UBO_SIZE as usize,
+                    );
+                    self.device.unmap_memory(resources.camera_memory);
+                }
+
+                self.device.cmd_bind_descriptor_sets(
+                    frame.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    resources.layout,
+                    0,
+                    &[resources.descriptor_set],
+                    &[],
+                );
+
+                for draw in draws {
+                    let Some(mesh) = Self::mesh_lookup(&self.meshes, draw.mesh) else {
+                        continue;
+                    };
+                    let push = PushConstants {
+                        model: draw.data.model.to_cols_array(),
+                        tint: draw.data.tint,
+                    };
+                    self.device.cmd_push_constants(
+                        frame.command_buffer,
+                        resources.layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        push_constant_bytes(&push),
+                    );
+                    self.device.cmd_bind_vertex_buffers(
+                        frame.command_buffer,
+                        0,
+                        &[mesh.vertex_buffer],
+                        &[0],
+                    );
+                    self.device.cmd_bind_index_buffer(
+                        frame.command_buffer,
+                        mesh.index_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    self.device.cmd_draw_indexed(
+                        frame.command_buffer,
+                        mesh.index_count,
+                        1,
+                        0,
+                        0,
+                        0,
+                    );
+                }
             }
             self.device.cmd_end_rendering(frame.command_buffer);
 
@@ -1421,4 +1630,23 @@ fn format_version(version: u32) -> String {
         (version >> 12) & 0x3ff,
         version & 0xfff
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_constant_layout_is_80_bytes() {
+        assert_eq!(
+            std::mem::size_of::<PushConstants>(),
+            PUSH_CONSTANT_SIZE as usize
+        );
+        assert_eq!(std::mem::align_of::<PushConstants>(), 4);
+    }
+
+    #[test]
+    fn camera_ubo_size_is_64_bytes() {
+        assert_eq!(CAMERA_UBO_SIZE, 64);
+    }
 }

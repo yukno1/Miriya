@@ -11,7 +11,7 @@
 | 当前阶段 | **M0 · 工程基线收敛**（脚手架已存在，尚未收敛） |
 | 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
 | 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
-| 玩法脚本 | **C#（.NET 10）**；不使用蓝图，不使用 WASM 脚本 |
+| 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
 | 物理 | **仅提供接口（`mir-physics`）**；不实现 Chaos/Rapier 等求解器，由外部后端注入 |
 | 编辑器 | **核心与 UI 框架解耦**（`mir-editor-core`）；GPUI 为候选，egui 可选 |
 | 迁移策略 | **不做 1:1 移植**；语义对齐，优先使用 Rust 语言特性（见 §1.3 / §4.2） |
@@ -158,7 +158,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
    暴露到公共 API；后续启用 Linux 时只替换平台后端，不重写子系统。
 2. **图形**：唯一渲染后端是 **Vulkan 1.3，通过 `vulkanalia`**。不引入 wgpu、ash、DX12、OpenGL、Metal，
    也不做第二套 RHI 抽象；Linux 后续复用同一套 Vulkan 渲染代码。
-3. **脚本**：**不使用蓝图，也不做任何可视化脚本/节点图系统**。游戏逻辑与创作代码使用 **C#（.NET 10）**，
+3. **脚本**：**不使用蓝图，也不做任何可视化脚本/节点图系统**。游戏逻辑与创作代码使用 **C#（.NET 11）**，
    引擎侧通过版本化 C ABI 与生成绑定对接；Rust 负责引擎与性能敏感路径。
 4. **C# 的边界**（本计划的默认解释）：C# 用于**游戏逻辑与编辑器中的游戏代码编辑**；编辑器外壳是
    Rust + **可插拔 UI 后端**（见 §5.7 / §9.15），不绑定 egui 或 GPUI。若要求编辑器 UI 也用 C#，需另立方案。
@@ -183,8 +183,8 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 |---|---|---|---|
 | `UObject` + UHT 代码生成反射 | 956 文件 / 12.5 MB | `#[derive(Reflect)]` 过程宏 + `TypeRegistry`（`mir-reflect`）；不模拟 UObject 继承/布局 | 无独立代码生成步骤，编译期即得元数据；代价是宏诊断与增量编译需打磨 |
 | Tracing GC（引擎对象） | 停顿与跨线程复杂 | `slotmap` 世代句柄 + 显式 `destroy` + `WeakHandle` | 确定性、无 STW；代价是环引用需手工弱化（C# 侧仍由 .NET GC 管理） |
-| Blueprint 虚拟机 | 庞大的字节码/节点图生态 | **完全不实现蓝图**；游戏逻辑用 C#（.NET 10）+ 版本化 C ABI | 无节点图与字节码负担，C# 生态成熟；代价是跨语言边界、GC 与热重载复杂度 |
-| C# 脚本层 | UE 无对应（UBT 用 C# 但不参与运行时） | `mir-script`：hostfxr 托管 .NET 10、生成绑定、可卸载 ALC 热重载 | 语言成熟、工具链完整；代价是 .NET 运行时依赖与互操作测试 |
+| Blueprint 虚拟机 | 庞大的字节码/节点图生态 | **完全不实现蓝图**；游戏逻辑用 C#（.NET 11）+ 版本化 C ABI | 无节点图与字节码负担，C# 生态成熟；代价是跨语言边界、GC 与热重载复杂度 |
+| C# 脚本层 | UE 无对应（UBT 用 C# 但不参与运行时） | `mir-script`：hostfxr 托管 .NET 11、生成绑定、可卸载 ALC 热重载 | 语言成熟、工具链完整；代价是 .NET 运行时依赖与互操作测试 |
 | Actor/Component + World | `Engine` 4,007 文件 | Actor 为「带层级/反射元数据的实体」，数据组件进 ECS；不做 C++ 继承/虚表 | 缓存友好、易并行；代价是保留一层 Actor 兼容外观 |
 | Chaos / 物理引擎 | 大规模自研 | **不实现**；`mir-physics` 只提供 `PhysicsBackend` 接口，外部后端注入 | 引擎不背求解器维护成本，用户可用自研后端；代价是后端契约、集成与性能由外部负责 |
 | Lumen / Nanite | 持续多年研发 | Clustered Forward+、CSM/IBL/SSAO；GI/虚拟几何列为研究 | 先保证稳定可玩；不承诺实时全局光照 |
@@ -207,7 +207,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 - 图像/资产：`gltf`、`image`、`ktx2`、`zstd`、`lz4_flex`、`notify`
 - 序列化/配置：`serde`、`toml`、`postcard`
 - 反射/对象：`slotmap`、自研 `mir-reflect` 过程宏
-- C# 宿主：`.NET 10`（LTS）、`netcorehost` / `hostfxr-sys`（托管）、C# 绑定生成（`mir-bindgen`）
+- C# 宿主：`.NET 11`、`netcorehost` / `hostfxr-sys`（托管）、C# 绑定生成（`mir-bindgen`）
 - 编辑器：`mir-editor-core`（无 UI 依赖）；UI 后端为可选项——`gpui`（候选）/ `egui`（备选），仅链接进编辑器二进制
 - 异步/并行：`rayon`（CPU 作业）、`crossbeam-channel`（线程通信）
 - 诊断：`tracing`（与 `mir-log` 桥接）、`tracy`（可选）、`criterion`、`cargo-fuzz`、`spirv-val`（CI）
@@ -444,7 +444,7 @@ Miriya/
 │   ├── mir-script/             # C# 托管：hostfxr、绑定、可卸载 ALC 热重载
 │   └── mir-terrain/            # 地形/植被（v1.x）
 ├── managed/
-│   ├── Miriya.Runtime/         # C# 引擎封装与生成的绑定（.NET 10）
+│   ├── Miriya.Runtime/         # C# 引擎封装与生成的绑定（.NET 11）
 │   └── Miriya.Scripting/       # 用户脚本基类、模板与示例
 ├── tools/
 │   ├── miriya-cli/             # new/run/build/cook/pack（M13）
@@ -540,7 +540,7 @@ Miriya/
 
 | ID | 里程碑 | 主要交付 | 退出标准（Gate） | 人周 |
 |---|---|---|---|---:|
-| **M0** | 工程基线收敛 | workspace 收敛、LICENSE、CI、rust-toolchain、ADR、拍平/成员补齐、facade 导出修正、`vulkanalia`/`.NET LTS` 依赖 spike | `cargo fmt/clippy/test --workspace` 全绿；Windows 测试 + Linux 编译检查 | 2 |
+| **M0** | 工程基线收敛 | workspace 收敛、LICENSE、CI、rust-toolchain、ADR、拍平/成员补齐、facade 导出修正、`vulkanalia`/`.NET` 依赖 spike | `cargo fmt/clippy/test --workspace` 全绿；Windows 测试 + Linux 编译检查 | 2 |
 | **M1** | 平台与循环（Windows） | winit 窗口/事件、Linux 平台 trait 占位、退出链路、输入快照、日志桥接、帧统计、`FramePipeline` | 打开窗口、按键/缩放、关闭可退出、headless 1000 帧测试、Linux `cargo check` 通过 | 4 |
 | **M2** | 渲染 v0（Vulkan） | `vulkanalia` 实例/设备/交换链、Slang→SPIR-V、深度、相机、网格/实例、基础 PBR、RenderGraph（含单 `.spv` 多入口整合）、管线缓存 | v0.2「旋转立方体 + 自由相机」1080p 稳定；Vulkan 校验层无错误 | 12 |
 | **M3** | 场景与 ECS | hecs 封装、Actor/Component、层级变换、序列化往返、场景加载/保存 | 10k 实体变换基准达标；关卡存取 golden 一致 | 8 |
@@ -548,7 +548,7 @@ Miriya/
 | **M5** | 材质与光照 | Slang module、材质参数/纹理、IBL、CSM、SSAO、Bloom/色调映射 | v0.3「PBR 场景」1080p 60fps（中端独显） | 10 |
 | **M6** | 物理接口（不含实现） | `PhysicsBackend` trait、世代句柄、固定步驱动、查询/事件/调试绘制、Null 后端、可复用契约测试 | mock 后端通过契约测试；外部后端可按文档接入；仓库内无求解器 | 6 |
 | **M7** | 游戏框架与输入 | GameMode/Pawn/Controller、输入 Action 映射、HUD 接口、存档 | 可玩 FPS 闭环的 Rust 侧骨架（移动/射击/死亡/重开） | 6 |
-| **M8** | C# 脚本运行时 | .NET 10 hostfxr 托管、版本化 C ABI、绑定生成、脚本生命周期、可卸载 ALC 热重载、C# 模板 | **用 C# 实现玩家移动/生成 Actor**；热重载 ≤ 1 s；无任何蓝图依赖 | 8 |
+| **M8** | C# 脚本运行时 | .NET 11 hostfxr 托管、版本化 C ABI、绑定生成、脚本生命周期、可卸载 ALC 热重载、C# 模板 | **用 C# 实现玩家移动/生成 Actor**；热重载 ≤ 1 s；无任何蓝图依赖 | 8 |
 | **M9** | 音频 | cpal 输出、混音器、解码、空间化、总线/效果 | 无爆音、设备切换稳定、offline 渲染测试 | 6 |
 | **M10** | 动画 | GPU 蒙皮、片段采样、混合树/状态机、根运动、IK 基础 | 50 角色 × 30 骨骼 60fps | 12 |
 | **M11** | 运行时 UI | 控件树、布局、输入路由、SDF 字体、UI pass、主题 | HUD/菜单/设置/暂停；UI ≤ 1 ms | 8 |
@@ -715,7 +715,7 @@ Miriya/
 ### 9.13 `mir-script`：C# 游戏脚本
 
 - **目标**：C# 是唯一的玩法脚本语言；**不使用蓝图、节点图或 WASM 脚本**。
-- **托管**：.NET 10（LTS）通过 `hostfxr`（`netcorehost`）在进程内加载；用户程序集由 `miriya build`
+- **托管**：.NET 11 通过 `hostfxr`（`netcorehost`）在进程内加载；用户程序集由 `miriya build`
   调用标准 `dotnet build` 编译；`Miriya.Runtime` 提供引擎封装与生成的绑定。
 - **边界**：版本化 C ABI（表驱动函数指针 + 不透明 64 位句柄）；C# 侧生成 `SafeHandle`，引擎校验句柄世代；
   禁止裸指针跨边界；字符串统一 UTF-8 + 显式所有权。
@@ -726,7 +726,7 @@ Miriya/
 - **生命周期**：`OnStart/OnUpdate/OnStop` 与 Actor/组件回调在主线程执行；退出时先停脚本，再卸载插件。
 - **热重载（开发）**：文件监听 + `dotnet build`；用户程序集放入可卸载 `AssemblyLoadContext`，
   重载后按稳定对象 ID 重新绑定；状态迁移尽力而为，失败则回退重启 PIE。
-- **发布**：随包分发 .NET 10 自包含运行时（以体积换免安装）；Native AOT 列为后续可选优化（不支持热重载）。
+- **发布**：随包分发 .NET 11 自包含运行时（以体积换免安装）；Native AOT 列为后续可选优化（不支持热重载）。
 - **性能**：不为每个实体做 P/Invoke；批量 `Span<T>`/native buffer；性能敏感路径留在 Rust；基准跟踪脚本开销。
 - **安全**：用户程序集是受信代码（非沙箱）；禁止在渲染/音频线程调用托管代码。
 - 验收：C# 脚本驱动玩家移动、生成/销毁 Actor、订阅输入；热重载 ≤ 1 s；打包后无需安装 SDK 即可运行。
@@ -790,7 +790,7 @@ Miriya/
 | `.mimap` | 关卡 | 头 + 反射序列化 | Actor/组件/层级/流式单元 |
 | `.mipak` | 烘焙包 | 索引 + 压缩块 | 运行时挂载，mmap |
 | `.slang` / `.spv` | 着色器源/编译产物 | Slang / SPIR-V | `slangc` 直接编译；缓存按管线哈希 |
-| `managed/*.csproj` | C# 脚本项目 | C# 源 + .NET 10 工程 | `dotnet build`；生成绑定来自 `mir-bindgen` |
+| `managed/*.csproj` | C# 脚本项目 | C# 源 + .NET 11 工程 | `dotnet build`；生成绑定来自 `mir-bindgen` |
 | `.dll` / `.deps.json` | C# 运行时程序集 | .NET 程序集 | 随包分发；开发期可卸载 ALC 热重载 |
 | 导入源 | glTF/GLB、PNG/KTX2、WAV/OGG/FLAC | 标准格式 | 构建期转换，不进入运行时 |
 
@@ -819,7 +819,7 @@ Miriya/
 
 - `Miriya.toml` 的 `[scripting]` 指定程序集、入口类型与热重载开关。
 - `miriya build` 调用 `dotnet publish`；`miriya run` 由 `mir-script` 通过 hostfxr 加载程序集。
-- 发布包包含自包含 .NET 10 运行时、用户程序集与 `.deps.json`；引擎与程序集通过版本化 C ABI 匹配，
+- 发布包包含自包含 .NET 11 运行时、用户程序集与 `.deps.json`；引擎与程序集通过版本化 C ABI 匹配，
   版本不匹配在启动时明确报错。
 - 编辑器保存时触发增量构建；失败时保留上一份可运行程序集并提示错误。
 - 不存在蓝图/可视化脚本资产格式；C# 程序集是唯一的脚本载体。
@@ -832,8 +832,9 @@ Miriya/
 
 - 只使用**稳定版 Rust（stable）**；Edition 2024；`rust-toolchain.toml` 固定 stable 通道（本机解析为 1.100.0）；
   MSRV 以 CI 为准，且不低于 edition 2024 的最低要求（1.85）。nightly 仅限 fuzz/bench 等非发布工具。
-- C# 侧固定 **.NET LTS**（当前基线 .NET 10，2026-11 M0 复核确认：.NET 10 为最新 LTS；.NET 11 为 STS 不采用），
-  `global.json` 锁定 SDK 版本；每个 M 里程碑复核一次，仅在出现新 LTS 时升级。
+- C# 侧固定 **.NET 版本**（当前基线 .NET 11，2026-11-23 M0 复核确认：.NET 11 与 .NET 10 终止支持日期相同，
+  均为 2028-11-14，在支持周期等价时选用更新版本），`global.json` 锁定 SDK 版本；
+  每个 M 里程碑复核一次支持周期，出现更早退役或支持终止的候选时升级。
   `dotnet format` 与 `dotnet test` 纳入 CI。
 - `rustfmt` 统一格式；Clippy 启用 `correctness/suspicious/complexity` 并 `-D warnings`，按需 allow。
 - 工作区统一 `[workspace.dependencies]` 与 `[workspace.lints]`；新增依赖需说明理由与许可证。
@@ -921,7 +922,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 
 - 0.x 阶段按语义化版本预发布（`v0.4.0` 对应垂直切片）；破坏性变更写 CHANGELOG。
 - 发布流程：CI 全绿 → 基准无回归 → Windows/Vulkan 冒烟 → 打 tag → 发布说明。
-- 发布产物为 Windows x64 自包含包（含 .NET 10 运行时）；Linux 只发布接口编译检查结果，不发布运行时。
+- 发布产物为 Windows x64 自包含包（含 .NET 11 运行时）；Linux 只发布接口编译检查结果，不发布运行时。
 - 每个里程碑结束更新本 README 的进度表与「当前进度」。
 
 ---
@@ -1006,7 +1007,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   不做 1:1 迁移/Rust 优先** 的新约束更新。
 - [x] 门面 `miriya-engine` 已 `pub use mir_log as log`，应用层可访问日志 API。
 - [x] 补齐工程基础设施：`LICENSE-MIT`、`LICENSE-APACHE`、`global.json` 与基础 GitHub Actions CI
-  （Windows: fmt/clippy/test + .NET 10 构建；Linux: `cargo check`）。
+  （Windows: fmt/clippy/test + .NET 11 构建；Linux: `cargo check`）。
 - [x] 主循环支持 `max_frames`，示例 `miriya-app` 可通过 `--frames N` 自动退出，不再只能 Ctrl+C 强杀。
 - [x] 渲染/窗口子系统文档注释已对齐唯一后端 `vulkanalia` / `winit` 规划。
 - [x] **M1 平台与循环**：`mir-window` 接入 winit 0.30 真实窗口与事件循环；键位映射覆盖字母/数字/F1–F12/
@@ -1044,7 +1045,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化并已有提交（含 M0 契约与 M2 第一阶段改动）。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
-7. `vulkanalia` 已从 PoC（RFC 0001）引入 `mir-render`；.NET 10 宿主仍未接入；
+7. `vulkanalia` 已从 PoC（RFC 0001）引入 `mir-render`；.NET 11 宿主仍未接入；
    `mir-script`、`mir-bindgen`、`managed/` 仍为空壳，需 M8 落地。
 8. 当前没有物理求解器（这是新约束）：`mir-physics` 已提供可编译的契约骨架与 `NullPhysicsBackend`，
    但求解器仍须由外部自研后端提供；引擎侧固定步/句柄表/坐标转换胶水留待 M6，v0.4 起需接入外部后端。
@@ -1078,7 +1079,7 @@ spirv-val shaders/hello/triangle.frag.spv
 
 `cargo check --workspace` 与 `cargo test --workspace` 当前通过（仅有既有的 unused dependency 警告）；
 窗口由 winit 创建，关闭窗口或按 Esc 均通过 `request_exit` 退出；`Engine::run_headless` 不创建事件循环，
-用于 headless 1000 帧测试。M8 起还需要 .NET 10 SDK 编译 C# 脚本。
+用于 headless 1000 帧测试。M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 
 ### 14.4 下一步（M0 任务清单）
 
@@ -1087,10 +1088,10 @@ spirv-val shaders/hello/triangle.frag.spv
       新模块接入时继续检查依赖方向。
 - [x] 添加 `rust-toolchain.toml`、`.editorconfig`。
 - [x] 添加 `LICENSE-MIT`、`LICENSE-APACHE`、`global.json`。
-- [x] CI：Windows（Slang shader 编译 + fmt/clippy/test + .NET 10 `dotnet build`）+ Linux（Slang shader 编译 + `cargo check` 接口检查）；已配置 Cargo 缓存。
+- [x] CI：Windows（Slang shader 编译 + fmt/clippy/test + .NET 11 `dotnet build`）+ Linux（Slang shader 编译 + `cargo check` 接口检查）；已配置 Cargo 缓存。
 - [x] `vulkanalia` 最小 PoC（`tools/mir-vulkan-probe`）：实例/物理设备/逻辑设备/surface/交换链前置查询全链路
       本机实测通过（Loader 1.4.341、Intel Iris Xe、Vulkan 1.3、B8G8R8A8_UNORM/IMMEDIATE），
-      风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 10 hostfxr 托管 PoC 属 M8 前置。
+      风险结论见 `docs/rfcs/0001-vulkanalia-poc.md`。**剩余**：.NET 11 hostfxr 托管 PoC 属 M8 前置。
 - [x] 起草 `PhysicsBackend` 契约与 `mir-editor-core` 边界（UI 无关），供 M6/M12 使用：
       两 crate 的骨架已落地并通过 `cargo test --workspace` 与 Clippy `-D warnings`；
       `thiserror = "2"` 已纳入 `[workspace.dependencies]`。
@@ -1113,7 +1114,7 @@ spirv-val shaders/hello/triangle.frag.spv
 - Rust API Guidelines：<https://rust-lang.github.io/api-guidelines/>
 - Vulkan 规范：<https://docs.vulkan.org/> · vulkanalia：<https://github.com/KyleMayes/vulkanalia>
 - Slang：<https://github.com/shader-slang/slang> · SPIR-V：<https://www.khronos.org/spir/>
-- .NET 10：<https://dotnet.microsoft.com/> · hostfxr 托管：<https://learn.microsoft.com/dotnet/core/tutorials/netcore-hosting>
+- .NET 11：<https://dotnet.microsoft.com/> · hostfxr 托管：<https://learn.microsoft.com/dotnet/core/tutorials/netcore-hosting>
 - winit：<https://github.com/rust-windowing/winit> · glam：<https://github.com/bitshifter/glam-rs>
 - hecs：<https://github.com/Ralith/hecs> · glTF 2.0：<https://www.khronos.org/gltf/>
 - GPUI（编辑器 UI 候选）：<https://github.com/zed-industries/zed/tree/main/crates/gpui>
@@ -1133,7 +1134,7 @@ spirv-val shaders/hello/triangle.frag.spv
 | Vulkan / vulkanalia | Miriya 唯一的图形后端；vulkanalia 是 Rust 的 Vulkan 绑定与辅助层 |
 | Slang | Miriya 的唯一着色器源语言；支持 module/import，经 `slangc` 直接生成 SPIR-V |
 | SPIR-V | Vulkan 使用的着色器中间格式；Miriya 由 Slang 经 `slangc` 直接编译得到 |
-| C# / .NET 10 | 唯一的玩法脚本语言与运行时；通过 hostfxr 在引擎进程内托管 |
+| C# / .NET 11 | 唯一的玩法脚本语言与运行时；通过 hostfxr 在引擎进程内托管 |
 | PhysicsBackend | 外部物理后端契约；Miriya 只提供接口、调度与契约测试，不含求解器 |
 | mir-editor-core / UI 后端 | 编辑器核心（UI 无关）与可插拔 UI 适配层（GPUI/egui），后者不进入运行时 |
 | GPUI / egui | 编辑器 UI 的候选/备选框架；由 ADR-0009 定选，核心逻辑不依赖它们 |

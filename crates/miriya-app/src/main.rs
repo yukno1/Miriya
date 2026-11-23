@@ -3,13 +3,17 @@
 use miriya_engine::core::{AppState, EngineConfig, EngineContext};
 use miriya_engine::ecs::World;
 use miriya_engine::input::KeyCode;
-use miriya_engine::math::Vec3;
+use miriya_engine::math::{Mat4, Quat, Vec3};
+use miriya_engine::render::{CameraFrame, InstanceData, MeshHandle};
 use miriya_engine::scene::Transform;
 
 /// 游戏状态：实现引擎的 `AppState` trait。
 struct Game {
     world: World,
     player: miriya_engine::ecs::Entity,
+    /// 立方体网格句柄（渲染初始化后才能创建，故惰性创建）。
+    cube_mesh: Option<MeshHandle>,
+    mesh_failed: bool,
 }
 
 impl Game {
@@ -26,7 +30,6 @@ impl Game {
         Self { world, player }
     }
 }
-
 impl AppState for Game {
     fn on_start(&mut self, ctx: &mut EngineContext) {
         println!(

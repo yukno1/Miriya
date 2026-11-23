@@ -7,10 +7,12 @@
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
 
+mod frame;
 mod geometry;
 mod mesh;
 mod vulkan;
 
+pub use frame::{CameraFrame, InstanceData};
 pub use geometry::cube;
 pub use mesh::{MeshData, MeshHandle, Vertex};
 
@@ -76,6 +78,8 @@ pub struct RenderContext {
     backend: Option<VulkanCore>,
     status: RendererStatus,
     clear_color: [f32; 4],
+    camera: CameraFrame,
+    draws: Vec<frame::DrawInstance>,
     frame_error: Option<String>,
 }
 
@@ -90,6 +94,8 @@ impl RenderContext {
             backend: None,
             status: RendererStatus::Uninitialized,
             clear_color: [0.0, 0.0, 0.0, 1.0],
+            camera: CameraFrame::default(),
+            draws: Vec::new(),
             frame_error: None,
         }
     }
@@ -194,10 +200,29 @@ impl RenderContext {
         }
     }
 
-    /// 记录本帧清屏色（实际清屏在 `end_frame` 提交）。
+    /// 记录本帧清屏色（实际清屏在 `end_frame` 提交），并清空上一帧的绘制请求。
     pub fn begin_frame(&mut self, clear_color: [f32; 4]) {
         debug_assert!(self.initialized);
         self.clear_color = clear_color;
+        self.draws.clear();
+    }
+
+    /// 本帧相机（view-projection）。
+    pub fn set_camera(&mut self, camera: CameraFrame) {
+        self.camera = camera;
+    }
+
+    /// 提交一次绘制：网格句柄 + 实例数据（同一网格可提交多次）。
+    pub fn submit(&mut self, mesh: MeshHandle, instance: InstanceData) {
+        self.draws.push(frame::DrawInstance {
+            mesh,
+            data: instance,
+        });
+    }
+
+    /// 本帧收集到的绘制请求数量（测试/诊断）。
+    pub fn submitted_instances(&self) -> usize {
+        self.draws.len()
     }
 
     /// 创建 GPU 网格：需要先完成渲染初始化（headless 下也可上传，只是不会被绘制）。
@@ -224,7 +249,13 @@ impl RenderContext {
             return;
         }
         if let Some(backend) = self.backend.as_mut() {
-            if let Err(error) = backend.render_frame(self.clear_color, self.width, self.height) {
+            if let Err(error) = backend.render_frame(
+                self.clear_color,
+                self.width,
+                self.height,
+                self.camera.view_proj,
+                &self.draws,
+            ) {
                 self.frame_error = Some(error);
             } else {
                 self.frame_error = None;
@@ -267,6 +298,23 @@ mod tests {
         let mut context = RenderContext::new(640, 480);
         context.resize(1024, 768);
         assert_eq!(context.size(), (1024, 768));
+    }
+
+    #[test]
+    fn submit_collects_and_begin_frame_clears() {
+        let mut context = RenderContext::new(320, 200);
+        context.init();
+
+        let mesh = crate::mesh::MeshHandle::from_parts(0, 0);
+        context.begin_frame([0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(context.submitted_instances(), 0);
+
+        context.submit(mesh, InstanceData::default());
+        context.submit(mesh, InstanceData::default());
+        assert_eq!(context.submitted_instances(), 2);
+
+        context.begin_frame([0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(context.submitted_instances(), 0);
     }
 
     #[test]
