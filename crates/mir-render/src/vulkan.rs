@@ -16,11 +16,18 @@ use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
 use crate::frame::DrawInstance;
+use crate::graph;
 use crate::mesh::{MeshData, MeshHandle, Vertex, indices_as_bytes, vertices_as_bytes};
 use mir_math::Mat4;
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+/// GPU 时间戳查询池容量：每 pass 2 个查询（pass 起/止），按 32 个 pass 上限预留。
+const TIMESTAMP_QUERY_COUNT: u32 = 64;
+
+/// `--graph-dump` 开启时每帧覆盖写入的依赖图 DOT 文件（工作目录下）。
+const GRAPH_DUMP_PATH: &str = "render_graph.dot";
 
 /// 查询 loader 是否提供 Khronos 校验层；缺失时调用方降级关闭而不是报错。
 fn validation_layer_available(entry: &Entry) -> bool {
@@ -147,6 +154,10 @@ struct FrameResources {
     camera_memory: vk::DeviceMemory,
     /// `camera_memory` 的持久映射；写入前由本帧 fence 保证 GPU 已读完上一轮内容。
     camera_mapped: *mut u8,
+    /// GPU 时间戳查询池（每 pass 2 个查询，R-05）；队列族不支持时间戳时为 `None`。
+    timestamp_pool: Option<vk::QueryPool>,
+    /// 上一轮该帧是否成功写入了 pass 时间戳（首轮为 false，避免读到未初始化查询）。
+    timings_valid: bool,
     extent: vk::Extent2D,
 }
 
@@ -309,6 +320,16 @@ pub(super) struct VulkanCore {
     format_value: Option<vk::SurfaceFormatKHR>,
     mode_value: Option<vk::PresentModeKHR>,
     extent: vk::Extent2D,
+    /// 每帧把 RenderGraph 编译产物 dump 成 DOT 文件（R-05，`--graph-dump` 控制）。
+    graph_dump: bool,
+    /// dump 落盘失败只告警一次。
+    dump_warned: bool,
+    /// graphics 队列族的 timestampValidBits（R-05；0 表示不支持时间戳）。
+    timestamp_valid_bits: u32,
+    /// 设备 limits.timestampPeriod（每个时间戳 tick 的纳秒数）。
+    timestamp_period: f32,
+    /// 上一帧各 GPU pass 的耗时（毫秒），由 `read_pass_timings` 回读填充。
+    last_pass_timings: Vec<(String, f32)>,
 }
 
 impl VulkanCore {
@@ -362,6 +383,16 @@ impl VulkanCore {
 
     pub(super) fn swapchain_image_count(&self) -> u32 {
         self.image_views.len() as u32
+    }
+
+    /// 开关每帧 RenderGraph 依赖图 dump（R-05）。
+    pub(super) fn set_graph_dump(&mut self, enabled: bool) {
+        self.graph_dump = enabled;
+    }
+
+    /// 上一帧各 GPU pass 的耗时（毫秒；headless/不支持时间戳时为空）。
+    pub(super) fn last_pass_timings(&self) -> &[(String, f32)] {
+        &self.last_pass_timings
     }
 
     fn create(
@@ -483,9 +514,21 @@ impl VulkanCore {
         let (physical_device, graphics_family, present_family, device_name, api_version) =
             chosen.ok_or(RenderInitError::NoDevice)?;
 
+        // 时间戳能力（R-05）：graphics 队列族的 timestampValidBits 与设备 limits.timestampPeriod。
+        // 不支持时仅关闭 pass 耗时统计，不影响渲染路径。
+        // SAFETY: physical_device 来自本实例的有效枚举结果。
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let timestamp_valid_bits = queue_families[graphics_family as usize].timestamp_valid_bits;
+        // SAFETY: physical_device 有效。
+        let timestamp_period = unsafe { instance.get_physical_device_properties(physical_device) }
+            .limits
+            .timestamp_period;
+
         // 查询并校验本渲染器依赖的两项可选特性：
         // - shaderDrawParameters：Slang 对 `SV_VertexID` 会声明 DrawParameters 能力；
         // - dynamicRendering：整个渲染路径都走 `vkCmdBeginRendering`，没有 render pass。
+        // - synchronization2：RenderGraph 编译器生成的 barrier 全部走 `vkCmdPipelineBarrier2`（R-04）。
         let mut probe11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut probe13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut probe2 = vk::PhysicalDeviceFeatures2::builder()
@@ -502,6 +545,11 @@ impl VulkanCore {
         if probe13.dynamic_rendering == 0 {
             return Err(RenderInitError::Device(
                 "设备不支持 dynamicRendering（Vulkan 1.3 可选特性）".into(),
+            ));
+        }
+        if probe13.synchronization2 == 0 {
+            return Err(RenderInitError::Device(
+                "设备不支持 synchronization2（Vulkan 1.3 可选特性）".into(),
             ));
         }
 
@@ -533,6 +581,7 @@ impl VulkanCore {
             .build();
         let mut features13 = vk::PhysicalDeviceVulkan13Features::builder()
             .dynamic_rendering(true)
+            .synchronization2(true)
             .build();
         let device_info = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_infos)
@@ -634,6 +683,11 @@ impl VulkanCore {
                 width: 0,
                 height: 0,
             },
+            graph_dump: false,
+            dump_warned: false,
+            timestamp_valid_bits,
+            timestamp_period,
+            last_pass_timings: Vec::new(),
         })
     }
 
@@ -859,6 +913,33 @@ impl VulkanCore {
             }
         };
 
+        // GPU 时间戳查询池（R-05）：每 pass 2 个查询（起/止）。队列族不支持时为 None，
+        // 仅关闭 pass 耗时统计。放在最后创建，之后的失败分支无需回收它。
+        let timestamp_pool = if self.timestamp_valid_bits > 0 {
+            let pool_info = vk::QueryPoolCreateInfo::builder()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TIMESTAMP_QUERY_COUNT);
+            // SAFETY: query_type/query_count 合法；查询池由本设备创建并随帧资源销毁。
+            match unsafe { self.device.create_query_pool(&pool_info, None) } {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    // SAFETY: 以上句柄由本设备创建且尚未销毁。
+                    unsafe {
+                        self.device.destroy_buffer(camera_buffer, None);
+                        self.device.free_memory(camera_memory, None);
+                        for semaphore in render_finished.drain(..) {
+                            self.device.destroy_semaphore(semaphore, None);
+                        }
+                        self.device.destroy_semaphore(image_available, None);
+                        self.device.destroy_fence(fence, None);
+                    }
+                    fail!(format!("创建时间戳查询池失败: {error}"))
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(FrameResources {
             command_pool,
             command_buffer,
@@ -868,6 +949,8 @@ impl VulkanCore {
             camera_buffer,
             camera_memory,
             camera_mapped,
+            timestamp_pool,
+            timings_valid: false,
             extent: self.extent,
         })
     }
@@ -1610,6 +1693,75 @@ impl VulkanCore {
         self.extent.width != width || self.extent.height != height
     }
 
+    /// 声明本帧的 RenderGraph（R-03）：imported 交换链图像（UNDEFINED → PRESENT）、
+    /// 深度图像（静态 DEPTH_ATTACHMENT_OPTIMAL）与绘制引用的网格 buffer，单个 graphics pass。
+    /// 返回图与 resource → (image, aspect) 的翻译表，供 barrier 生成时定位 vk::Image。
+    fn build_frame_graph(
+        &self,
+        draws: &[DrawInstance],
+        image_index: u32,
+    ) -> (
+        graph::RenderGraph,
+        Vec<(graph::ResourceId, vk::Image, vk::ImageAspectFlags)>,
+    ) {
+        let mut frame_graph = graph::RenderGraph::new();
+        let swapchain = frame_graph.import_image(
+            "swapchain".to_string(),
+            graph::ImageLayout::Undefined,
+            Some(graph::ImageLayout::Present),
+        );
+        let depth = frame_graph.import_image(
+            "depth".to_string(),
+            graph::ImageLayout::DepthAttachment,
+            None,
+        );
+        // 本帧绘制用到的网格 buffer：作为 imported 资源进入图（无布局、不生成 barrier，
+        // 用于依赖图 dump 的完整性）。
+        let mut meshes_seen: Vec<MeshHandle> = Vec::new();
+        for draw in draws {
+            if !meshes_seen.contains(&draw.mesh) {
+                frame_graph.import_buffer(format!(
+                    "mesh[{}g{}]",
+                    draw.mesh.index(),
+                    draw.mesh.generation()
+                ));
+                meshes_seen.push(draw.mesh);
+            }
+        }
+        frame_graph.add_graphics_pass("main_geometry".to_string(), vec![swapchain], Some(depth));
+
+        let mut images = Vec::with_capacity(2);
+        images.push((
+            swapchain,
+            self.swapchain_images[image_index as usize],
+            vk::ImageAspectFlags::COLOR,
+        ));
+        if let Some(depth_resources) = &self.depth {
+            images.push((depth, depth_resources.image, vk::ImageAspectFlags::DEPTH));
+        }
+        (frame_graph, images)
+    }
+
+    /// 每帧把当前图与编译产物 dump 成 DOT 文件（R-05，`--graph-dump` 开启时）。
+    /// 覆盖写同一文件（各帧 barrier 计划一致）；IO 失败仅告警一次，不影响渲染。
+    fn write_graph_dump(
+        &mut self,
+        frame_graph: &graph::RenderGraph,
+        compiled: &graph::CompiledGraph,
+    ) {
+        let dot = frame_graph.dump_dot(compiled);
+        if let Err(error) = std::fs::write(GRAPH_DUMP_PATH, dot)
+            && !self.dump_warned
+        {
+            mir_log::warn!(
+                target: "vulkan",
+                "RenderGraph dump 写入 {} 失败: {error}",
+                GRAPH_DUMP_PATH
+            );
+            self.dump_warned = true;
+        }
+    }
+
     /// 录制一帧：清屏 → 逐实例绘制 → 提交 → 呈现。无交换链时为空操作（headless）。
     ///
     /// 交换链失效（`OUT_OF_DATE`）不视为帧错误：标记后本帧跳过，下一帧开头按当前窗口尺寸重建。
@@ -1678,185 +1830,234 @@ impl VulkanCore {
                 .begin_command_buffer(frame.command_buffer, &begin_info)
                 .map_err(|error| format!("开始命令缓冲录制失败: {error}"))?;
 
-            let image = self.swapchain_images[index as usize];
+            // —— 图声明与编译（R-03/R-04）：不持有帧资源借用。 ——
+            // 每帧声明 RenderGraph：导入交换链图像（UNDEFINED → PRESENT）、深度图像
+            // （创建时已一次性转入 DEPTH_ATTACHMENT_OPTIMAL，静态布局）与本帧绘制
+            // 引用的网格 buffer；单个 graphics pass。编译产物驱动录制与 barrier。
+            let (frame_graph, graph_images) = self.build_frame_graph(draws, index);
+            let compiled = frame_graph
+                .compile()
+                .map_err(|error| format!("RenderGraph 编译失败: {error}"))?;
+            if self.graph_dump {
+                self.write_graph_dump(&frame_graph, &compiled);
+            }
+
+            // —— GPU 时间戳（R-05）：fence 等待已保证上一轮该帧的查询完成，先回读再重录。 ——
+            let pass_count = compiled.pass_order.len();
+            let timestamp_pool = self.frames[frame_index].timestamp_pool;
+            let timed = timestamp_pool.is_some()
+                && self.timestamp_valid_bits > 0
+                && 2 * pass_count <= TIMESTAMP_QUERY_COUNT as usize;
+            if timed && self.frames[frame_index].timings_valid {
+                self.last_pass_timings = read_pass_timings(
+                    &self.device,
+                    timestamp_pool.expect("时间戳查询池存在"),
+                    &frame_graph,
+                    &compiled,
+                    self.timestamp_period,
+                );
+            }
+
             // 空切片需要显式类型，否则无法推导 `Cast` 目标。
-            let no_memory_barriers: [vk::MemoryBarrier; 0] = [];
-            let no_buffer_barriers: [vk::BufferMemoryBarrier; 0] = [];
-            let subresource = vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build();
+            let no_memory_barriers: [vk::MemoryBarrier2; 0] = [];
+            let no_buffer_barriers: [vk::BufferMemoryBarrier2; 0] = [];
 
-            // 从"未定义"转到颜色附件：本帧首操作是 CLEAR，旧内容本就要丢弃，
-            // 因此用 UNDEFINED 作 oldLayout 即可，无需跟踪每张图像的历史布局。
-            let to_color_attachment = vk::ImageMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .build();
-            self.device.cmd_pipeline_barrier(
-                frame.command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &no_memory_barriers,
-                &no_buffer_barriers,
-                &[to_color_attachment],
-            );
-
-            let clear = vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: clear_color,
-                },
-            };
-            let attachment = vk::RenderingAttachmentInfo::builder()
-                .image_view(self.image_views[index as usize])
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(clear);
-            let render_area = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: frame.extent,
-            };
-            let depth = self
-                .depth
-                .as_ref()
-                .ok_or_else(|| "深度资源未初始化".to_string())?;
-            let depth_attachment = vk::RenderingAttachmentInfo::builder()
-                .image_view(depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                })
-                .build();
-            let attachments = [attachment];
-            let rendering_info = vk::RenderingInfo::builder()
-                .render_area(render_area)
-                .layer_count(1)
-                .color_attachments(&attachments)
-                .depth_attachment(&depth_attachment);
-            self.device
-                .cmd_begin_rendering(frame.command_buffer, &rendering_info);
-            if let Some(resources) = &self.pipeline {
-                let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: frame.extent.width as f32,
-                    height: frame.extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                let viewports = [viewport];
-                let scissors = [render_area];
-                self.device
-                    .cmd_set_viewport(frame.command_buffer, 0, &viewports);
-                self.device
-                    .cmd_set_scissor(frame.command_buffer, 0, &scissors);
-                self.device.cmd_bind_pipeline(
-                    frame.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    resources.pipeline,
-                );
-
-                // 相机 UBO：写入当前帧的持久映射。
-                // 本帧 fence 等待已保证上一轮该帧的 GPU 读取结束，HOST_COHERENT 无需 flush。
-                let camera_matrix = view_proj.to_cols_array();
-                // SAFETY: camera_mapped 是创建时 map_memory 得到的持久映射指针，
-                // 有效范围 CAMERA_UBO_SIZE 字节，仅由本对象独占访问。
-                std::ptr::copy_nonoverlapping(
-                    camera_matrix.as_ptr().cast::<u8>(),
-                    frame.camera_mapped,
-                    CAMERA_UBO_SIZE as usize,
-                );
-
-                let descriptor_set = resources.descriptor_sets[frame_index];
-                self.device.cmd_bind_descriptor_sets(
-                    frame.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    resources.layout,
+            if timed {
+                // SAFETY（外层 unsafe）：查询池属于本帧资源；复位发生在本轮录制开头，
+                // 上一轮结果已回读完毕。
+                self.device.cmd_reset_query_pool(
+                    self.frames[frame_index].command_buffer,
+                    timestamp_pool.expect("时间戳查询池存在"),
                     0,
-                    &[descriptor_set],
-                    &[],
+                    TIMESTAMP_QUERY_COUNT,
                 );
+            }
 
-                for draw in draws {
-                    let Some(mesh) = Self::mesh_lookup(&self.meshes, draw.mesh) else {
-                        continue;
-                    };
-                    let push = PushConstants {
-                        model: draw.data.model.to_cols_array(),
-                        tint: draw.data.tint,
-                    };
-                    self.device.cmd_push_constants(
-                        frame.command_buffer,
-                        resources.layout,
-                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                        0,
-                        push_constant_bytes(&push),
+            // —— 图编译产物驱动的逐 pass 录制（R-04）：barrier/layout 全部由编译器生成， ——
+            // 替换 v0.2 的 acquire 后 / 呈现前两处手写 barrier；深度一次性转换并入
+            // imported 资源初始化语义（初始布局即 DEPTH_ATTACHMENT_OPTIMAL，无每帧 barrier）。
+            for (position, pass_id) in compiled.pass_order.iter().enumerate() {
+                let pass = &frame_graph.passes()[pass_id.0];
+                let command_buffer = self.frames[frame_index].command_buffer;
+                for barrier in &compiled.pre_pass_barriers[position] {
+                    emit_image_barrier(
+                        &self.device,
+                        command_buffer,
+                        barrier,
+                        &graph_images,
+                        &no_memory_barriers,
+                        &no_buffer_barriers,
                     );
-                    self.device.cmd_bind_vertex_buffers(
-                        frame.command_buffer,
-                        0,
-                        &[mesh.vertex_buffer],
-                        &[0],
+                }
+                if timed {
+                    let pool = timestamp_pool.expect("时间戳查询池存在");
+                    // SAFETY（外层 unsafe）：查询池已复位、下标在容量内；录制中写入，
+                    // stage 为合法管线阶段。
+                    self.device.cmd_write_timestamp2(
+                        command_buffer,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        pool,
+                        (2 * position) as u32,
                     );
-                    self.device.cmd_bind_index_buffer(
-                        frame.command_buffer,
-                        mesh.index_buffer,
-                        0,
-                        vk::IndexType::UINT32,
-                    );
-                    self.device.cmd_draw_indexed(
-                        frame.command_buffer,
-                        mesh.index_count,
-                        1,
-                        0,
-                        0,
-                        0,
+                }
+                match &pass.kind {
+                    graph::PassKind::Graphics { .. } => {
+                        let frame = &mut self.frames[frame_index];
+                        let clear = vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: clear_color,
+                            },
+                        };
+                        let attachment = vk::RenderingAttachmentInfo::builder()
+                            .image_view(self.image_views[index as usize])
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(clear);
+                        let render_area = vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: frame.extent,
+                        };
+                        let depth = self
+                            .depth
+                            .as_ref()
+                            .ok_or_else(|| "深度资源未初始化".to_string())?;
+                        let depth_attachment = vk::RenderingAttachmentInfo::builder()
+                            .image_view(depth.view)
+                            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .clear_value(vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            })
+                            .build();
+                        let attachments = [attachment];
+                        let rendering_info = vk::RenderingInfo::builder()
+                            .render_area(render_area)
+                            .layer_count(1)
+                            .color_attachments(&attachments)
+                            .depth_attachment(&depth_attachment);
+                        self.device
+                            .cmd_begin_rendering(frame.command_buffer, &rendering_info);
+                        if let Some(resources) = &self.pipeline {
+                            let viewport = vk::Viewport {
+                                x: 0.0,
+                                y: 0.0,
+                                width: frame.extent.width as f32,
+                                height: frame.extent.height as f32,
+                                min_depth: 0.0,
+                                max_depth: 1.0,
+                            };
+                            let viewports = [viewport];
+                            let scissors = [render_area];
+                            self.device
+                                .cmd_set_viewport(frame.command_buffer, 0, &viewports);
+                            self.device
+                                .cmd_set_scissor(frame.command_buffer, 0, &scissors);
+                            self.device.cmd_bind_pipeline(
+                                frame.command_buffer,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                resources.pipeline,
+                            );
+
+                            // 相机 UBO：写入当前帧的持久映射。
+                            // 本帧 fence 等待已保证上一轮该帧的 GPU 读取结束，HOST_COHERENT 无需 flush。
+                            let camera_matrix = view_proj.to_cols_array();
+                            // SAFETY: camera_mapped 是创建时 map_memory 得到的持久映射指针，
+                            // 有效范围 CAMERA_UBO_SIZE 字节，仅由本对象独占访问。
+                            std::ptr::copy_nonoverlapping(
+                                camera_matrix.as_ptr().cast::<u8>(),
+                                frame.camera_mapped,
+                                CAMERA_UBO_SIZE as usize,
+                            );
+
+                            let descriptor_set = resources.descriptor_sets[frame_index];
+                            self.device.cmd_bind_descriptor_sets(
+                                frame.command_buffer,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                resources.layout,
+                                0,
+                                &[descriptor_set],
+                                &[],
+                            );
+
+                            for draw in draws {
+                                let Some(mesh) = Self::mesh_lookup(&self.meshes, draw.mesh) else {
+                                    continue;
+                                };
+                                let push = PushConstants {
+                                    model: draw.data.model.to_cols_array(),
+                                    tint: draw.data.tint,
+                                };
+                                self.device.cmd_push_constants(
+                                    frame.command_buffer,
+                                    resources.layout,
+                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                                    0,
+                                    push_constant_bytes(&push),
+                                );
+                                self.device.cmd_bind_vertex_buffers(
+                                    frame.command_buffer,
+                                    0,
+                                    &[mesh.vertex_buffer],
+                                    &[0],
+                                );
+                                self.device.cmd_bind_index_buffer(
+                                    frame.command_buffer,
+                                    mesh.index_buffer,
+                                    0,
+                                    vk::IndexType::UINT32,
+                                );
+                                self.device.cmd_draw_indexed(
+                                    frame.command_buffer,
+                                    mesh.index_count,
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            }
+                            self.device.cmd_end_rendering(frame.command_buffer);
+                        }
+                    }
+                    // 每帧图内不含 transfer pass；网格上传走独立阻塞路径（保留 staging barrier）。
+                    graph::PassKind::Transfer { .. } => {}
+                }
+                if timed {
+                    let pool = timestamp_pool.expect("时间戳查询池存在");
+                    // SAFETY（外层 unsafe）：查询池已复位、下标在容量内；pass 结束处写入。
+                    self.device.cmd_write_timestamp2(
+                        command_buffer,
+                        vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                        pool,
+                        (2 * position + 1) as u32,
                     );
                 }
             }
-            self.device.cmd_end_rendering(frame.command_buffer);
-
-            // 呈现前转回 PRESENT_SRC_KHR，保证 next acquire 与 present engine 看到一致的布局。
-            let to_present = vk::ImageMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(subresource)
-                .build();
-            self.device.cmd_pipeline_barrier(
-                frame.command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &no_memory_barriers,
-                &no_buffer_barriers,
-                &[to_present],
-            );
+            // 帧末 barrier：编译器按 imported 资源的 final 布局生成（交换链 → PRESENT_SRC_KHR）。
+            let command_buffer = self.frames[frame_index].command_buffer;
+            for barrier in &compiled.final_barriers {
+                emit_image_barrier(
+                    &self.device,
+                    command_buffer,
+                    barrier,
+                    &graph_images,
+                    &no_memory_barriers,
+                    &no_buffer_barriers,
+                );
+            }
+            if timed {
+                self.frames[frame_index].timings_valid = true;
+            }
 
             self.device
-                .end_command_buffer(frame.command_buffer)
+                .end_command_buffer(self.frames[frame_index].command_buffer)
                 .map_err(|error| format!("结束命令缓冲录制失败: {error}"))?;
 
+            let frame = &mut self.frames[frame_index];
             let wait_semaphores = [frame.image_available];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = [frame.command_buffer];
@@ -1950,6 +2151,9 @@ impl Drop for VulkanCore {
                 // 持久映射随内存释放自动解除。
                 self.device.destroy_buffer(frame.camera_buffer, None);
                 self.device.free_memory(frame.camera_memory, None);
+                if let Some(pool) = frame.timestamp_pool {
+                    self.device.destroy_query_pool(pool, None);
+                }
                 self.device.destroy_command_pool(frame.command_pool, None);
             }
             // 管线销毁必须发生在命令缓冲执行完毕之后。
@@ -1975,6 +2179,154 @@ impl Drop for VulkanCore {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// 把编译器产出的 barrier 翻译成 synchronization2 的图像 barrier 并录入命令缓冲（R-04）。
+fn emit_image_barrier(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    barrier: &graph::Barrier,
+    graph_images: &[(graph::ResourceId, vk::Image, vk::ImageAspectFlags)],
+    memory_barriers: &[vk::MemoryBarrier2],
+    buffer_barriers: &[vk::BufferMemoryBarrier2],
+) {
+    let Some((_, image, aspect)) = graph_images
+        .iter()
+        .find(|(resource, _, _)| *resource == barrier.resource)
+    else {
+        mir_log::warn!(target: "vulkan", "RenderGraph barrier 引用了未导入的图像资源，已跳过");
+        return;
+    };
+    let subresource = vk::ImageSubresourceRange::builder()
+        .aspect_mask(*aspect)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1)
+        .build();
+    // 每 pass 前置 barrier 独立成组：src/dst 阶段由编译器按资源最近一次写入推导。
+    let image_barrier = vk::ImageMemoryBarrier2::builder()
+        .src_stage_mask(map_stages(barrier.src_stage))
+        .dst_stage_mask(map_stages(barrier.dst_stage))
+        .src_access_mask(map_access(barrier.src_access))
+        .dst_access_mask(map_access(barrier.dst_access))
+        .old_layout(map_layout(barrier.src_layout))
+        .new_layout(map_layout(barrier.dst_layout))
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(*image)
+        .subresource_range(subresource)
+        .build();
+    let image_barriers = [image_barrier];
+    let dependency_info = vk::DependencyInfo::builder()
+        .memory_barriers(memory_barriers)
+        .buffer_memory_barriers(buffer_barriers)
+        .image_memory_barriers(&image_barriers);
+    // SAFETY: command_buffer 处于录制中；图像有效且布局由编译器逐帧追踪。
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency_info) };
+}
+
+/// 回读上一轮该帧的 pass 时间戳并换算为毫秒（R-05）。
+/// 调用前提：本帧 fence 已等待（上一轮提交完成）；查询池已按 pass 数写满。
+fn read_pass_timings(
+    device: &Device,
+    pool: vk::QueryPool,
+    frame_graph: &graph::RenderGraph,
+    compiled: &graph::CompiledGraph,
+    period_ns: f32,
+) -> Vec<(String, f32)> {
+    let pass_count = compiled.pass_order.len();
+    if pass_count == 0 {
+        return Vec::new();
+    }
+    let query_count = 2 * pass_count;
+    // vulkanalia 以字节切片暴露结果缓冲：u64 × 查询数，stride 8。
+    let mut bytes = vec![0u8; 8 * query_count];
+    let flags = vk::QueryResultFlags::_64 | vk::QueryResultFlags::WAIT;
+    // SAFETY: pool 有效且调用方已通过 fence 确认上一轮提交完成；WAIT 阻塞至结果可用。
+    let read =
+        unsafe { device.get_query_pool_results(pool, 0, query_count as u32, &mut bytes, 8, flags) };
+    if let Err(error) = read {
+        mir_log::warn!(target: "vulkan", "读取 GPU pass 时间戳失败: {error}");
+        return Vec::new();
+    }
+    // 时间戳为 64 位整型，小端序（x86/ARM 均为本机小端）。
+    let results: Vec<u64> = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
+        .collect();
+    compiled
+        .pass_order
+        .iter()
+        .enumerate()
+        .map(|(position, pass_id)| {
+            let name = frame_graph.passes()[pass_id.0].name.clone();
+            let nanos = (results[2 * position + 1].saturating_sub(results[2 * position])) as f64
+                * period_ns as f64;
+            (name, (nanos / 1_000_000.0) as f32)
+        })
+        .collect()
+}
+
+/// 纯数据布局 → Vulkan 布局。
+fn map_layout(layout: graph::ImageLayout) -> vk::ImageLayout {
+    match layout {
+        graph::ImageLayout::Undefined => vk::ImageLayout::UNDEFINED,
+        graph::ImageLayout::ColorAttachment => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        graph::ImageLayout::DepthAttachment => vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+        graph::ImageLayout::Present => vk::ImageLayout::PRESENT_SRC_KHR,
+    }
+}
+
+/// 纯数据阶段位集 → Vulkan PipelineStageFlags2。
+fn map_stages(stages: graph::Stages) -> vk::PipelineStageFlags2 {
+    let mut flags = vk::PipelineStageFlags2::empty();
+    if stages.contains(graph::Stages::TOP_OF_PIPE) {
+        flags |= vk::PipelineStageFlags2::TOP_OF_PIPE;
+    }
+    if stages.contains(graph::Stages::EARLY_FRAGMENT_TESTS) {
+        flags |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS;
+    }
+    if stages.contains(graph::Stages::LATE_FRAGMENT_TESTS) {
+        flags |= vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+    }
+    if stages.contains(graph::Stages::COLOR_ATTACHMENT_OUTPUT) {
+        flags |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+    }
+    if stages.contains(graph::Stages::BOTTOM_OF_PIPE) {
+        flags |= vk::PipelineStageFlags2::BOTTOM_OF_PIPE;
+    }
+    if stages.contains(graph::Stages::TRANSFER) {
+        // VK_PIPELINE_STAGE_2_TRANSFER_BIT 在 vulkanalia 中命名为 ALL_TRANSFER。
+        flags |= vk::PipelineStageFlags2::ALL_TRANSFER;
+    }
+    if stages.contains(graph::Stages::VERTEX_INPUT) {
+        flags |= vk::PipelineStageFlags2::VERTEX_INPUT;
+    }
+    flags
+}
+
+/// 纯数据访问位集 → Vulkan AccessFlags2。
+fn map_access(access: graph::Access) -> vk::AccessFlags2 {
+    let mut flags = vk::AccessFlags2::empty();
+    if access.contains(graph::Access::COLOR_ATTACHMENT_WRITE) {
+        flags |= vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+    }
+    if access.contains(graph::Access::DEPTH_STENCIL_ATTACHMENT_WRITE) {
+        flags |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+    }
+    if access.contains(graph::Access::SHADER_READ) {
+        flags |= vk::AccessFlags2::SHADER_READ;
+    }
+    if access.contains(graph::Access::TRANSFER_WRITE) {
+        flags |= vk::AccessFlags2::TRANSFER_WRITE;
+    }
+    if access.contains(graph::Access::VERTEX_ATTRIBUTE_READ) {
+        flags |= vk::AccessFlags2::VERTEX_ATTRIBUTE_READ;
+    }
+    flags
 }
 
 fn format_version(version: u32) -> String {
