@@ -127,14 +127,26 @@ fn create_debug_messenger(instance: &Instance) -> Option<vk::DebugUtilsMessenger
     }
 }
 
-/// 单帧录制与同步资源（当前只保留一帧在飞行，简化 CPU/GPU 同步）。
+/// 帧在飞行数：CPU 可领先 GPU 的帧数。每帧拥有独立的命令资源、同步原语与相机 UBO。
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// 单帧录制与同步资源；共 [`MAX_FRAMES_IN_FLIGHT`] 份环形复用，
+/// 复用前通过本帧 fence 等待上一轮该帧的 GPU 工作完成。
 struct FrameResources {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    /// 每帧一个 acquire 信号量：帧在飞行保证同一信号量不会被并发 acquire 复用。
     image_available: vk::Semaphore,
-    /// 每张交换链图像一个呈现信号量：避免同一信号量在"已呈现但尚未重新 acquire"的图像间复用。
+    /// 每张交换链图像一个呈现信号量（每帧各持一份）：
+    /// 避免同一信号量在"已呈现但尚未重新 acquire"的图像间复用（v0.2 VUID-00067 修复），
+    /// 每帧再各持一份以适配多帧在飞行。
     render_finished: Vec<vk::Semaphore>,
+    /// 相机 UBO（每帧一份，HOST_VISIBLE|COHERENT，持久映射）。
+    camera_buffer: vk::Buffer,
+    camera_memory: vk::DeviceMemory,
+    /// `camera_memory` 的持久映射；写入前由本帧 fence 保证 GPU 已读完上一轮内容。
+    camera_mapped: *mut u8,
     extent: vk::Extent2D,
 }
 
@@ -143,11 +155,72 @@ struct PipelineResources {
     fragment_module: vk::ShaderModule,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
-    camera_buffer: vk::Buffer,
-    camera_memory: vk::DeviceMemory,
+    /// 每帧一个相机 UBO 描述符集，按下标与 `VulkanCore::frames` 对齐。
+    descriptor_sets: Vec<vk::DescriptorSet>,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+}
+
+/// [`VulkanCore::init_pipeline`] 中途失败的回收守卫：任一步返回错误即按逆序销毁已创建对象；
+/// 成功路径通过 [`PipelineGuard::defuse`] 移交所有权。
+struct PipelineGuard<'a> {
+    device: &'a Device,
+    vertex_module: Option<vk::ShaderModule>,
+    fragment_module: Option<vk::ShaderModule>,
+    descriptor_set_layout: Option<vk::DescriptorSetLayout>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    pipeline_layout: Option<vk::PipelineLayout>,
+    pipeline: Option<vk::Pipeline>,
+}
+
+impl PipelineGuard<'_> {
+    /// 成功路径：移交全部所有权，此后 Drop 为空操作。
+    #[allow(clippy::type_complexity)]
+    fn defuse(
+        mut self,
+    ) -> (
+        vk::ShaderModule,
+        vk::ShaderModule,
+        vk::DescriptorSetLayout,
+        vk::DescriptorPool,
+        vk::PipelineLayout,
+        vk::Pipeline,
+    ) {
+        (
+            self.vertex_module.take().expect("顶点着色器模块已创建"),
+            self.fragment_module.take().expect("片元着色器模块已创建"),
+            self.descriptor_set_layout.take().expect("描述符布局已创建"),
+            self.descriptor_pool.take().expect("描述符池已创建"),
+            self.pipeline_layout.take().expect("管线布局已创建"),
+            self.pipeline.take().expect("图形管线已创建"),
+        )
+    }
+}
+
+impl Drop for PipelineGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: 各对象由本设备创建且尚未移交所有权；描述符集随池销毁一并释放。
+        unsafe {
+            if let Some(pipeline) = self.pipeline.take() {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            if let Some(layout) = self.pipeline_layout.take() {
+                self.device.destroy_pipeline_layout(layout, None);
+            }
+            if let Some(pool) = self.descriptor_pool.take() {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            if let Some(layout) = self.descriptor_set_layout.take() {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
+            if let Some(module) = self.fragment_module.take() {
+                self.device.destroy_shader_module(module, None);
+            }
+            if let Some(module) = self.vertex_module.take() {
+                self.device.destroy_shader_module(module, None);
+            }
+        }
+    }
 }
 
 /// 相机 UBO（binding 0）：`view_proj`（4 × 4 f32）。
@@ -197,10 +270,13 @@ struct MeshSlot {
     mesh: Option<GpuMesh>,
 }
 
-/// Vulkan 核心对象。按 pipeline → frame → image views → swapchain → surface → device → instance 的逆序销毁。
+/// Vulkan 核心对象。按 frame → pipeline → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
     pipeline: Option<PipelineResources>,
-    frame: Option<FrameResources>,
+    /// 每帧独立资源，环形复用；仅带 surface 路径创建。
+    frames: Vec<FrameResources>,
+    /// 当前使用的帧下标（环形递增）。
+    frame_index: usize,
     depth: Option<DepthResources>,
     depth_format: Option<vk::Format>,
     /// 交换链被 acquire/present 报告为失效，需在下一帧重建。
@@ -526,7 +602,8 @@ impl VulkanCore {
 
         Ok(Self {
             pipeline: None,
-            frame: None,
+            frames: Vec::new(),
+            frame_index: 0,
             depth: None,
             depth_format: None,
             swapchain_outdated: false,
@@ -656,72 +733,164 @@ impl VulkanCore {
     }
 
     fn init_frame_resources(&mut self) -> Result<(), String> {
+        let semaphore_info = vk::SemaphoreCreateInfo::builder();
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            // 单帧资源创建失败时先就地回收已创建的句柄，再向上传播错误。
+            let frame = self.create_frame_sync(&semaphore_info)?;
+            self.frames.push(frame);
+        }
+        Ok(())
+    }
+
+    /// 创建一帧的全部资源：命令池/缓冲、fence（创建即 SIGNALED）、信号量与相机 UBO（持久映射）。
+    ///
+    /// 失败时销毁本次已创建的对象，不产生泄漏。
+    fn create_frame_sync(
+        &self,
+        semaphore_info: &vk::SemaphoreCreateInfoBuilder,
+    ) -> Result<FrameResources, String> {
         let pool_info = vk::CommandPoolCreateInfo::builder()
             .queue_family_index(self.graphics_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: graphics_family 是本设备支持的队列族。
         let command_pool = unsafe { self.device.create_command_pool(&pool_info, None) }
             .map_err(|error| format!("创建命令池失败: {error}"))?;
+
+        // 任一步失败都经 `fail` 就地回收已创建的句柄。
+        macro_rules! fail {
+            ($error:expr) => {{
+                let error: String = $error;
+                // SAFETY: 以下句柄由本设备创建且尚未销毁。
+                unsafe {
+                    self.device.destroy_command_pool(command_pool, None);
+                }
+                return Err(error);
+            }};
+        }
+
         let allocate_info = vk::CommandBufferAllocateInfo::builder()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         // SAFETY: command_pool 有效，请求一个主命令缓冲。
-        let command_buffer = unsafe { self.device.allocate_command_buffers(&allocate_info) }
+        let command_buffer = match unsafe { self.device.allocate_command_buffers(&allocate_info) }
             .map_err(|error| format!("分配命令缓冲失败: {error}"))?
             .into_iter()
             .next()
-            .ok_or_else(|| "命令缓冲分配结果为空".to_string())?;
+        {
+            Some(buffer) => buffer,
+            None => fail!("命令缓冲分配结果为空".to_string()),
+        };
 
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
-        // SAFETY: fence_info 有效。
-        let fence = unsafe { self.device.create_fence(&fence_info, None) }
-            .map_err(|error| format!("创建 fence 失败: {error}"))?;
-        let semaphore_info = vk::SemaphoreCreateInfo::builder();
+        // SAFETY: fence_info 有效；创建即 SIGNALED 保证该帧首轮不被阻塞。
+        let fence = match unsafe { self.device.create_fence(&fence_info, None) } {
+            Ok(fence) => fence,
+            Err(error) => fail!(format!("创建 fence 失败: {error}")),
+        };
+
         // SAFETY: semaphore_info 有效。
-        let image_available = unsafe { self.device.create_semaphore(&semaphore_info, None) }
-            .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+        let image_available = match unsafe { self.device.create_semaphore(semaphore_info, None) } {
+            Ok(semaphore) => semaphore,
+            Err(error) => {
+                // SAFETY: fence 由本设备创建且尚未销毁。
+                unsafe { self.device.destroy_fence(fence, None) };
+                fail!(format!("创建 semaphore 失败: {error}"))
+            }
+        };
         let mut render_finished = Vec::with_capacity(self.image_views.len());
         for _ in 0..self.image_views.len() {
             // SAFETY: semaphore_info 有效。
-            let semaphore = unsafe { self.device.create_semaphore(&semaphore_info, None) }
-                .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+            let semaphore = match unsafe { self.device.create_semaphore(semaphore_info, None) } {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    // SAFETY: 以上句柄由本设备创建且尚未销毁。
+                    unsafe {
+                        self.device.destroy_semaphore(image_available, None);
+                        self.device.destroy_fence(fence, None);
+                    }
+                    fail!(format!("创建 semaphore 失败: {error}"))
+                }
+            };
             render_finished.push(semaphore);
         }
 
-        self.frame = Some(FrameResources {
+        let (camera_buffer, camera_memory) = match self.create_buffer(
+            CAMERA_UBO_SIZE,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                // SAFETY: 以上句柄由本设备创建且尚未销毁。
+                unsafe {
+                    for semaphore in render_finished.drain(..) {
+                        self.device.destroy_semaphore(semaphore, None);
+                    }
+                    self.device.destroy_semaphore(image_available, None);
+                    self.device.destroy_fence(fence, None);
+                }
+                fail!(error)
+            }
+        };
+        // 持久映射：HOST_COHERENT 无需 flush，映射保持到内存释放。
+        let mapped = unsafe {
+            self.device.map_memory(
+                camera_memory,
+                0,
+                CAMERA_UBO_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
+        };
+        let camera_mapped = match mapped {
+            Ok(mapped) => mapped.cast::<u8>(),
+            Err(error) => {
+                // SAFETY: 以上句柄由本设备创建且尚未销毁。
+                unsafe {
+                    self.device.destroy_buffer(camera_buffer, None);
+                    self.device.free_memory(camera_memory, None);
+                    for semaphore in render_finished.drain(..) {
+                        self.device.destroy_semaphore(semaphore, None);
+                    }
+                    self.device.destroy_semaphore(image_available, None);
+                    self.device.destroy_fence(fence, None);
+                }
+                fail!(format!("映射相机 UBO 失败: {error}"))
+            }
+        };
+
+        Ok(FrameResources {
             command_pool,
             command_buffer,
             fence,
             image_available,
             render_finished,
+            camera_buffer,
+            camera_memory,
+            camera_mapped,
             extent: self.extent,
-        });
-        Ok(())
+        })
     }
 
-    /// 交换链重建后同步更新呈现信号量（数量跟随交换链图像数）。
+    /// 交换链重建后同步更新各帧的呈现信号量（数量跟随交换链图像数）。
     ///
     /// 调用方必须先 `device_wait_idle`，否则旧信号量可能仍被呈现操作引用。
     fn recreate_render_finished(&mut self) -> Result<(), String> {
         let semaphore_info = vk::SemaphoreCreateInfo::builder();
         let image_count = self.image_views.len();
-        let frame = self
-            .frame
-            .as_mut()
-            .ok_or_else(|| "帧资源尚未初始化".to_string())?;
-
-        // SAFETY: device 已空闲，旧信号量不再被任何提交或呈现操作引用。
-        unsafe {
-            for semaphore in frame.render_finished.drain(..) {
-                self.device.destroy_semaphore(semaphore, None);
+        for frame in &mut self.frames {
+            // SAFETY: device 已空闲，旧信号量不再被任何提交或呈现操作引用。
+            unsafe {
+                for semaphore in frame.render_finished.drain(..) {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
             }
-        }
-        for _ in 0..image_count {
-            // SAFETY: semaphore_info 有效。
-            let semaphore = unsafe { self.device.create_semaphore(&semaphore_info, None) }
-                .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
-            frame.render_finished.push(semaphore);
+            for _ in 0..image_count {
+                // SAFETY: semaphore_info 有效。
+                let semaphore = unsafe { self.device.create_semaphore(&semaphore_info, None) }
+                    .map_err(|error| format!("创建 semaphore 失败: {error}"))?;
+                frame.render_finished.push(semaphore);
+            }
         }
         Ok(())
     }
@@ -1150,18 +1319,31 @@ impl VulkanCore {
         const FRAGMENT_CODE: &[u32] =
             vulkanalia::include_shader_code!("../../../shaders/cube/cube.frag.spv");
 
+        // 失败回收守卫：任一步出错即销毁已创建对象，成功时 defuse 移交所有权。
+        let mut guard = PipelineGuard {
+            device: &self.device,
+            vertex_module: None,
+            fragment_module: None,
+            descriptor_set_layout: None,
+            descriptor_pool: None,
+            pipeline_layout: None,
+            pipeline: None,
+        };
+
         let vertex_info = vk::ShaderModuleCreateInfo::builder()
             .code_size(VERTEX_CODE.len() * 4)
             .code(VERTEX_CODE);
         // SAFETY: VERTEX_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
         let vertex_module = unsafe { self.device.create_shader_module(&vertex_info, None) }
             .map_err(|error| format!("创建顶点着色器模块失败: {error}"))?;
+        guard.vertex_module = Some(vertex_module);
         let fragment_info = vk::ShaderModuleCreateInfo::builder()
             .code_size(FRAGMENT_CODE.len() * 4)
             .code(FRAGMENT_CODE);
         // SAFETY: FRAGMENT_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
         let fragment_module = unsafe { self.device.create_shader_module(&fragment_info, None) }
             .map_err(|error| format!("创建片元着色器模块失败: {error}"))?;
+        guard.fragment_module = Some(fragment_module);
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::builder()
@@ -1260,49 +1442,63 @@ impl VulkanCore {
                 .create_descriptor_set_layout(&descriptor_layout_info, None)
         }
         .map_err(|error| format!("创建描述符布局失败: {error}"))?;
+        guard.descriptor_set_layout = Some(descriptor_set_layout);
 
         let pool_sizes = [vk::DescriptorPoolSize {
             type_: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 1,
+            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
             .pool_sizes(&pool_sizes)
-            .max_sets(1);
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
         // SAFETY: 池大小与最大集合数有效。
         let descriptor_pool = unsafe { self.device.create_descriptor_pool(&pool_info, None) }
             .map_err(|error| format!("创建描述符池失败: {error}"))?;
+        guard.descriptor_pool = Some(descriptor_pool);
 
-        let set_layouts = [descriptor_set_layout];
+        // 分配请求每帧一个集合；管线布局仍只声明 1 个 set。
+        let allocate_layouts = [descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
         let allocate_info = vk::DescriptorSetAllocateInfo::builder()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&set_layouts);
-        // SAFETY: 池与布局有效，请求 1 个描述符集。
+            .set_layouts(&allocate_layouts);
+        // SAFETY: 池与布局有效，请求每帧一个描述符集。
         let descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&allocate_info) }
             .map_err(|error| format!("分配描述符集失败: {error}"))?;
-        let descriptor_set = *descriptor_sets
-            .first()
-            .ok_or_else(|| "描述符集分配结果为空".to_string())?;
+        if descriptor_sets.len() != self.frames.len() {
+            return Err(format!(
+                "描述符集数量与帧数不一致: {} != {}",
+                descriptor_sets.len(),
+                self.frames.len()
+            ));
+        }
 
-        let (camera_buffer, camera_memory) = self.create_buffer(
-            CAMERA_UBO_SIZE,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let buffer_info = vk::DescriptorBufferInfo::builder()
-            .buffer(camera_buffer)
-            .offset(0)
-            .range(CAMERA_UBO_SIZE)
-            .build();
+        // 相机 UBO 属于每帧资源（`frames`），这里只为各帧描述符集写入绑定。
+        let buffer_infos: Vec<vk::DescriptorBufferInfo> = self
+            .frames
+            .iter()
+            .map(|frame| {
+                vk::DescriptorBufferInfo::builder()
+                    .buffer(frame.camera_buffer)
+                    .offset(0)
+                    .range(CAMERA_UBO_SIZE)
+                    .build()
+            })
+            .collect();
         // 必须命名中间数组：`WriteDescriptorSet` 保存的是指针，临时数组会在语句结束即失效
         // （debug 构建侥幸可用，release 优化后会读到已经被覆盖的栈内存）。
-        let buffer_infos = [buffer_info];
-        let writes = [vk::WriteDescriptorSet::builder()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&buffer_infos)
-            .build()];
-        // SAFETY: 描述符集有效，buffer_infos 在调用期间有效。
+        let writes: Vec<vk::WriteDescriptorSet> = descriptor_sets
+            .iter()
+            .zip(&buffer_infos)
+            .map(|(&set, info)| {
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+                    .build()
+            })
+            .collect();
+        // SAFETY: 描述符集与 buffer_infos（命名 Vec）在调用期间有效。
         unsafe {
             let no_copies: [vk::CopyDescriptorSet; 0] = [];
             self.device.update_descriptor_sets(&writes, &no_copies);
@@ -1314,12 +1510,14 @@ impl VulkanCore {
             .size(PUSH_CONSTANT_SIZE)
             .build();
         let push_ranges = [push_range];
+        let single_layouts = [descriptor_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&set_layouts)
+            .set_layouts(&single_layouts)
             .push_constant_ranges(&push_ranges);
         // SAFETY: layout_info 有效：1 个描述符集 + 80 字节 push constants。
         let layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(|error| format!("创建管线布局失败: {error}"))?;
+        guard.pipeline_layout = Some(layout);
 
         let format = self
             .format_value
@@ -1356,15 +1554,23 @@ impl VulkanCore {
             .into_iter()
             .next()
             .ok_or_else(|| "图形管线创建结果为空".to_string())?;
+        guard.pipeline = Some(pipeline);
 
+        // 全部对象创建成功：从守卫移交所有权。
+        let (
+            vertex_module,
+            fragment_module,
+            descriptor_set_layout,
+            descriptor_pool,
+            layout,
+            pipeline,
+        ) = guard.defuse();
         self.pipeline = Some(PipelineResources {
             vertex_module,
             fragment_module,
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_set,
-            camera_buffer,
-            camera_memory,
+            descriptor_sets,
             layout,
             pipeline,
         });
@@ -1374,6 +1580,7 @@ impl VulkanCore {
     fn destroy_pipeline(&mut self) {
         if let Some(resources) = self.pipeline.take() {
             // SAFETY: 这些对象由本对象创建且尚未销毁；调用方保证 GPU 已空闲。
+            // 相机 UBO 属于每帧资源，随帧资源销毁，不在这里释放。
             unsafe {
                 self.device.destroy_pipeline(resources.pipeline, None);
                 self.device.destroy_pipeline_layout(resources.layout, None);
@@ -1381,8 +1588,6 @@ impl VulkanCore {
                     .destroy_descriptor_pool(resources.descriptor_pool, None);
                 self.device
                     .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
-                self.device.destroy_buffer(resources.camera_buffer, None);
-                self.device.free_memory(resources.camera_memory, None);
                 self.device
                     .destroy_shader_module(resources.fragment_module, None);
                 self.device
@@ -1410,6 +1615,9 @@ impl VulkanCore {
     /// 交换链失效（`OUT_OF_DATE`）不视为帧错误：标记后本帧跳过，下一帧开头按当前窗口尺寸重建。
     /// `width` / `height` 是应用层已知的窗口尺寸，用于重建时取最新目标大小；
     /// `view_proj` 是本帧相机，`draws` 是应用层提交的实例列表。
+    ///
+    /// 帧资源按 `frame_index` 环形复用（[`MAX_FRAMES_IN_FLIGHT`] 帧在飞行）：
+    /// 复用前等待本帧 fence，保证上一轮该帧的 GPU 工作（含 UBO 读取）已完成。
     pub(super) fn render_frame(
         &mut self,
         clear_color: [f32; 4],
@@ -1432,13 +1640,14 @@ impl VulkanCore {
         };
         // 交换链尺寸与窗口尺寸是否不一致；先算好，避免持有 `frame` 可变借用时再借 `self`。
         let target_differs = self.target_differs(width, height);
-        let frame = match self.frame.as_mut() {
-            Some(frame) => frame,
-            None => return Ok(()),
-        };
+        if self.frames.len() != MAX_FRAMES_IN_FLIGHT {
+            return Ok(());
+        }
+        let frame_index = self.frame_index;
 
-        // SAFETY: fence/semaphore/命令缓冲均有效且由本对象独占；等待上一帧完成后再复用。
+        // SAFETY: fence/semaphore/命令缓冲均有效且由本对象独占；等待上一轮该帧完成后再复用。
         unsafe {
+            let frame = &mut self.frames[frame_index];
             self.device
                 .wait_for_fences(&[frame.fence], true, u64::MAX)
                 .map_err(|error| format!("等待 GPU 完成失败: {error}"))?;
@@ -1563,29 +1772,24 @@ impl VulkanCore {
                     resources.pipeline,
                 );
 
-                // 相机 UBO：单帧在飞行，写完即用（HOST_VISIBLE|COHERENT）。
+                // 相机 UBO：写入当前帧的持久映射。
+                // 本帧 fence 等待已保证上一轮该帧的 GPU 读取结束，HOST_COHERENT 无需 flush。
                 let camera_matrix = view_proj.to_cols_array();
-                let mapped = self.device.map_memory(
-                    resources.camera_memory,
-                    0,
-                    CAMERA_UBO_SIZE,
-                    vk::MemoryMapFlags::empty(),
+                // SAFETY: camera_mapped 是创建时 map_memory 得到的持久映射指针，
+                // 有效范围 CAMERA_UBO_SIZE 字节，仅由本对象独占访问。
+                std::ptr::copy_nonoverlapping(
+                    camera_matrix.as_ptr().cast::<u8>(),
+                    frame.camera_mapped,
+                    CAMERA_UBO_SIZE as usize,
                 );
-                if let Ok(mapped) = mapped {
-                    std::ptr::copy_nonoverlapping(
-                        camera_matrix.as_ptr().cast::<u8>(),
-                        mapped.cast::<u8>(),
-                        CAMERA_UBO_SIZE as usize,
-                    );
-                    self.device.unmap_memory(resources.camera_memory);
-                }
 
+                let descriptor_set = resources.descriptor_sets[frame_index];
                 self.device.cmd_bind_descriptor_sets(
                     frame.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     resources.layout,
                     0,
-                    &[resources.descriptor_set],
+                    &[descriptor_set],
                     &[],
                 );
 
@@ -1656,7 +1860,7 @@ impl VulkanCore {
             let wait_semaphores = [frame.image_available];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = [frame.command_buffer];
-            // 用本张图像专属的呈现信号量，避免在图像未重新 acquire 前复用。
+            // 本帧与本张图像专属的呈现信号量，避免在图像未重新 acquire 前复用。
             let render_finished = frame.render_finished[index as usize];
             let signal_semaphores = [render_finished];
             let submit = vk::SubmitInfo::builder()
@@ -1689,6 +1893,9 @@ impl VulkanCore {
                 Err(error) => return Err(format!("呈现失败: {error}")),
             }
         }
+        // 本帧提交完成，推进到下一帧资源；acquire 提前返回的路径不推进，
+        // 下次仍从同一帧资源开始（其 fence 尚未重置，状态一致）。
+        self.frame_index = (frame_index + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }
 
@@ -1719,7 +1926,7 @@ impl VulkanCore {
             self.destroy_pipeline();
             self.init_pipeline()?;
         }
-        if let Some(frame) = self.frame.as_mut() {
+        for frame in &mut self.frames {
             frame.extent = self.extent;
         }
         Ok(())
@@ -1729,15 +1936,20 @@ impl VulkanCore {
 impl Drop for VulkanCore {
     fn drop(&mut self) {
         // SAFETY: 本对象仍持有有效的 Vulkan 句柄；先等待 GPU 空闲，再按
-        // pipeline → frame → image views → swapchain → surface → messenger → device → instance 逆序释放。
+        // frame → pipeline → image views → swapchain → surface → messenger → device → instance 逆序释放。
         unsafe {
-            if let Some(frame) = self.frame.take() {
+            if !self.frames.is_empty() {
                 let _ = self.device.device_wait_idle();
+            }
+            for frame in self.frames.drain(..) {
                 for semaphore in frame.render_finished {
                     self.device.destroy_semaphore(semaphore, None);
                 }
                 self.device.destroy_semaphore(frame.image_available, None);
                 self.device.destroy_fence(frame.fence, None);
+                // 持久映射随内存释放自动解除。
+                self.device.destroy_buffer(frame.camera_buffer, None);
+                self.device.free_memory(frame.camera_memory, None);
                 self.device.destroy_command_pool(frame.command_pool, None);
             }
             // 管线销毁必须发生在命令缓冲执行完毕之后。
@@ -1790,6 +2002,12 @@ mod tests {
     #[test]
     fn camera_ubo_size_is_64_bytes() {
         assert_eq!(CAMERA_UBO_SIZE, 64);
+    }
+
+    #[test]
+    fn frames_in_flight_is_two() {
+        // 批次 A 的决策：2 帧在飞行；修改时需同步核对信号量复用与 UBO 环形写入。
+        assert_eq!(MAX_FRAMES_IN_FLIGHT, 2);
     }
 
     #[test]

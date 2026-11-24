@@ -1109,7 +1109,8 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
       代码内校验层 + `mir-log` 桥接、release 悬垂指针修复、CI 双 shader 校验；详见
       `docs/plans/v0.2-cube.md` §9/§10。
 - [ ] **M2 剩余**：RenderGraph v0.5、2–3 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存、
-      自研显存子分配器、网格/材质系统与基础 PBR（v0.3 前置）。
+      自研显存子分配器、网格/材质系统与基础 PBR（v0.3 前置）；任务清单与验收 Gate 见
+      `docs/plans/m2-remaining.md`。
 - [ ] **M3**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene` 收敛到 `mir-math`
       并按 ADR-0012 校准演示单位（米 → 厘米）。
 - [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
