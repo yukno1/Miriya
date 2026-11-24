@@ -2,9 +2,8 @@
 //!
 //! 渲染层只接受纯数据（顶点/索引），不访问 ECS/场景（ADR-0004 的 extract 边界）。
 
-/// 顶点：位置 + 颜色。
+/// 顶点：位置 + 颜色 + 法线（R-12：stride 24 → 36）。
 ///
-/// v0.2 无光照，颜色直接写入顶点；后续 `Vertex` 会扩展法线/UV 并拆分 layout。
 /// `repr(C)` 且只含 `f32`，因此没有填充、可按字节上传（见 [`vertices_as_bytes`]）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,20 +12,26 @@ pub struct Vertex {
     pub position: [f32; 3],
     /// 线性颜色（RGBA 中的 RGB，alpha 由管线固定为 1）。
     pub color: [f32; 3],
+    /// 模型空间法线（假定单位长度；PBR 光照用）。
+    pub normal: [f32; 3],
 }
 
 impl Vertex {
-    /// 单个顶点的字节数（6 × f32，无填充）。
-    pub const SIZE: usize = 24;
+    /// 单个顶点的字节数（9 × f32，无填充）。
+    pub const SIZE: usize = 36;
 
-    pub const fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-        Self { position, color }
+    pub const fn new(position: [f32; 3], color: [f32; 3], normal: [f32; 3]) -> Self {
+        Self {
+            position,
+            color,
+            normal,
+        }
     }
 }
 
 /// 顶点切片 → 字节视图（用于上传到 GPU）。
 pub(crate) fn vertices_as_bytes(vertices: &[Vertex]) -> &[u8] {
-    // SAFETY: `Vertex` 为 repr(C) 且只含 f32，无填充、大小 = 24；
+    // SAFETY: `Vertex` 为 repr(C) 且只含 f32，无填充、大小 = 36；
     // u8 对齐要求更低，按字节读取整个切片是合法的。
     unsafe {
         std::slice::from_raw_parts(
@@ -93,15 +98,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vertex_layout_is_24_bytes() {
+    fn vertex_layout_is_36_bytes() {
         assert_eq!(std::mem::size_of::<Vertex>(), Vertex::SIZE);
         assert_eq!(std::mem::align_of::<Vertex>(), 4);
 
-        let vertex = Vertex::new([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+        let vertex = Vertex::new([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]);
         let bytes = vertices_as_bytes(std::slice::from_ref(&vertex));
         assert_eq!(bytes.len(), Vertex::SIZE);
         assert_eq!(&bytes[0..4], &1.0f32.to_ne_bytes());
         assert_eq!(&bytes[12..16], &4.0f32.to_ne_bytes());
+        assert_eq!(&bytes[24..28], &7.0f32.to_ne_bytes());
     }
 
     #[test]
@@ -115,17 +121,18 @@ mod tests {
         let empty = MeshData::default();
         assert!(!empty.is_valid());
 
-        let no_indices = MeshData::new(vec![Vertex::new([0.0; 3], [0.0; 3])], Vec::new());
+        let no_indices = MeshData::new(vec![Vertex::new([0.0; 3], [0.0; 3], [0.0; 3])], Vec::new());
         assert!(!no_indices.is_valid());
 
-        let out_of_range = MeshData::new(vec![Vertex::new([0.0; 3], [0.0; 3])], vec![0, 1]);
+        let out_of_range =
+            MeshData::new(vec![Vertex::new([0.0; 3], [0.0; 3], [0.0; 3])], vec![0, 1]);
         assert!(!out_of_range.is_valid());
 
         let valid = MeshData::new(
             vec![
-                Vertex::new([0.0; 3], [0.0; 3]),
-                Vertex::new([1.0; 3], [1.0; 3]),
-                Vertex::new([2.0; 3], [2.0; 3]),
+                Vertex::new([0.0; 3], [0.0; 3], [0.0; 3]),
+                Vertex::new([1.0; 3], [1.0; 3], [0.0; 3]),
+                Vertex::new([2.0; 3], [2.0; 3], [0.0; 3]),
             ],
             vec![0, 1, 2],
         );
