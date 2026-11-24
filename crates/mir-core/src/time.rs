@@ -53,6 +53,9 @@ pub struct FrameStats {
     pub frames: u64,
     pub fps: f32,
     pub frame_time_ms: f32,
+    /// 上一帧各 GPU pass 的耗时（毫秒，pass 名 → 耗时），由渲染层回读时间戳填充
+    /// （M2 批次 B R-05）；headless 或设备不支持时间戳时为空。
+    pub gpu_pass_timings: Vec<(String, f32)>,
 }
 
 impl FrameStats {
