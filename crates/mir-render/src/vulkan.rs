@@ -15,6 +15,7 @@ use vulkanalia::window as vulkan_window;
 use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
+use crate::allocator::{Allocation, MemoryAllocator};
 use crate::frame::DrawInstance;
 use crate::graph;
 use crate::mesh::{MeshData, MeshHandle, Vertex, indices_as_bytes, vertices_as_bytes};
@@ -193,10 +194,11 @@ struct FrameResources {
     /// 避免同一信号量在"已呈现但尚未重新 acquire"的图像间复用（v0.2 VUID-00067 修复），
     /// 每帧再各持一份以适配多帧在飞行。
     render_finished: Vec<vk::Semaphore>,
-    /// 相机 UBO（每帧一份，HOST_VISIBLE|COHERENT，持久映射）。
+    /// 相机 UBO（每帧一份，HOST_VISIBLE|COHERENT，持久映射；dedicated 整块分配，
+    /// 避免 staging 的 map/unmap 影响同一块内存中的持久映射）。
     camera_buffer: vk::Buffer,
-    camera_memory: vk::DeviceMemory,
-    /// `camera_memory` 的持久映射；写入前由本帧 fence 保证 GPU 已读完上一轮内容。
+    camera_allocation: Allocation,
+    /// `camera_allocation` 的持久映射；写入前由本帧 fence 保证 GPU 已读完上一轮内容。
     camera_mapped: *mut u8,
     /// GPU 时间戳查询池（每 pass 2 个查询，R-05）；队列族不支持时间戳时为 `None`。
     timestamp_pool: Option<vk::QueryPool>,
@@ -298,19 +300,34 @@ fn push_constant_bytes(pc: &PushConstants) -> &[u8] {
 /// 深度附件资源：单采样、静态布局（创建后即为 `DEPTH_ATTACHMENT_OPTIMAL`）。
 struct DepthResources {
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    allocation: Allocation,
     view: vk::ImageView,
 }
 
-/// 一个已上传到显存的网格（顶点/索引各一次独立分配，v0.2 无子分配器）。
+/// 分配好的 buffer 及其显存区间（批次 E 起全部缓冲资源统一经分配器）。
+struct GpuBuffer {
+    buffer: vk::Buffer,
+    allocation: Allocation,
+}
+
+/// 一个已上传到显存的网格（顶点/索引各一段子分配）。
 struct GpuMesh {
     vertex_buffer: vk::Buffer,
-    vertex_memory: vk::DeviceMemory,
+    vertex_allocation: Allocation,
     index_buffer: vk::Buffer,
-    index_memory: vk::DeviceMemory,
+    index_allocation: Allocation,
     /// 绘制时读取（V-13 提交 API）。
     #[allow(dead_code)]
     index_count: u32,
+}
+
+/// 延迟销毁条目（R-09）：GPU 缓冲 + 显存区间 + 关联帧 fence。
+///
+/// fence 信号后（所有引用该资源的提交已完成）才真正 `destroy_buffer` 并归还分配器；
+/// 队列按 fence 提交顺序天然有序，绑定「下一帧」的 fence 即可覆盖全部更早的在飞提交。
+struct DeletionEntry {
+    fence: vk::Fence,
+    buffers: Vec<(vk::Buffer, Allocation)>,
 }
 
 /// 网格槽位：世代号用于让销毁后的旧 [`MeshHandle`] 自动失效。
@@ -351,6 +368,10 @@ pub(super) struct VulkanCore {
     transfer_command_buffer: vk::CommandBuffer,
     meshes: Vec<MeshSlot>,
     free_meshes: Vec<u32>,
+    /// 待销毁的 GPU 缓冲（R-09）：绑定帧 fence 延迟回收。
+    deletions: Vec<DeletionEntry>,
+    /// 显存子分配器（R-08）：声明在 `device` 之前，保证字段 Drop 顺序安全。
+    allocator: MemoryAllocator,
     graphics_family: u32,
     present_family: u32,
     device_name: String,
@@ -433,6 +454,11 @@ impl VulkanCore {
     /// 上一帧各 GPU pass 的耗时（毫秒；headless/不支持时间戳时为空）。
     pub(super) fn last_pass_timings(&self) -> &[(String, f32)] {
         &self.last_pass_timings
+    }
+
+    /// 分配器未释放的子分配字节数（R-10 泄漏守恒断言用）。
+    pub(super) fn allocated_bytes(&self) -> u64 {
+        self.allocator.allocated_bytes()
     }
 
     fn create(
@@ -635,6 +661,11 @@ impl VulkanCore {
         let graphics_queue = unsafe { device.get_device_queue(graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(present_family, 0) };
 
+        // 显存子分配器（R-08）：构造时自行查询 memory properties 与 bufferImageGranularity。
+        // SAFETY: physical_device 有效。
+        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let allocator = MemoryAllocator::new(device.clone(), &instance, physical_device, limits);
+
         // 上传/布局转换用独立命令池：不依赖每帧资源，headless 下也能创建网格。
         let pool_info = vk::CommandPoolCreateInfo::builder()
             .queue_family_index(graphics_family)
@@ -712,6 +743,8 @@ impl VulkanCore {
             transfer_command_buffer,
             meshes: Vec::new(),
             free_meshes: Vec::new(),
+            deletions: Vec::new(),
+            allocator,
             graphics_family,
             present_family,
             device_name,
@@ -841,7 +874,7 @@ impl VulkanCore {
     ///
     /// 失败时销毁本次已创建的对象，不产生泄漏。
     fn create_frame_sync(
-        &self,
+        &mut self,
         semaphore_info: &vk::SemaphoreCreateInfoBuilder,
     ) -> Result<FrameResources, String> {
         let pool_info = vk::CommandPoolCreateInfo::builder()
@@ -910,10 +943,12 @@ impl VulkanCore {
             render_finished.push(semaphore);
         }
 
-        let (camera_buffer, camera_memory) = match self.create_buffer(
+        // 相机 UBO：dedicated 整块分配（持久映射不能与 staging 的 map/unmap 共享块）。
+        let camera = match self.create_buffer(
             CAMERA_UBO_SIZE,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            true,
         ) {
             Ok(created) => created,
             Err(error) => {
@@ -931,8 +966,8 @@ impl VulkanCore {
         // 持久映射：HOST_COHERENT 无需 flush，映射保持到内存释放。
         let mapped = unsafe {
             self.device.map_memory(
-                camera_memory,
-                0,
+                camera.allocation.memory,
+                camera.allocation.offset,
                 CAMERA_UBO_SIZE,
                 vk::MemoryMapFlags::empty(),
             )
@@ -942,14 +977,14 @@ impl VulkanCore {
             Err(error) => {
                 // SAFETY: 以上句柄由本设备创建且尚未销毁。
                 unsafe {
-                    self.device.destroy_buffer(camera_buffer, None);
-                    self.device.free_memory(camera_memory, None);
+                    self.device.destroy_buffer(camera.buffer, None);
                     for semaphore in render_finished.drain(..) {
                         self.device.destroy_semaphore(semaphore, None);
                     }
                     self.device.destroy_semaphore(image_available, None);
                     self.device.destroy_fence(fence, None);
                 }
+                self.allocator.free(&camera.allocation);
                 fail!(format!("映射相机 UBO 失败: {error}"))
             }
         };
@@ -966,14 +1001,14 @@ impl VulkanCore {
                 Err(error) => {
                     // SAFETY: 以上句柄由本设备创建且尚未销毁。
                     unsafe {
-                        self.device.destroy_buffer(camera_buffer, None);
-                        self.device.free_memory(camera_memory, None);
+                        self.device.destroy_buffer(camera.buffer, None);
                         for semaphore in render_finished.drain(..) {
                             self.device.destroy_semaphore(semaphore, None);
                         }
                         self.device.destroy_semaphore(image_available, None);
                         self.device.destroy_fence(fence, None);
                     }
+                    self.allocator.free(&camera.allocation);
                     fail!(format!("创建时间戳查询池失败: {error}"))
                 }
             }
@@ -987,8 +1022,8 @@ impl VulkanCore {
             fence,
             image_available,
             render_finished,
-            camera_buffer,
-            camera_memory,
+            camera_buffer: camera.buffer,
+            camera_allocation: camera.allocation,
             camera_mapped,
             timestamp_pool,
             timings_valid: false,
@@ -1097,16 +1132,35 @@ impl VulkanCore {
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        let allocate_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type)
-            .build();
-        // SAFETY: 分配参数来自 image 的内存需求，memory_type 已在设备内存类型中校验。
-        let memory = unsafe { self.device.allocate_memory(&allocate_info, None) }
-            .map_err(|error| format!("分配深度图像内存失败: {error}"))?;
-        // SAFETY: image 与 memory 由本设备创建，偏移 0 在分配范围内。
-        unsafe { self.device.bind_image_memory(image, memory, 0) }
-            .map_err(|error| format!("绑定深度图像内存失败: {error}"))?;
+        let allocation = self
+            .allocator
+            .alloc(
+                requirements.size,
+                requirements.alignment,
+                memory_type,
+                false,
+            )
+            .map_err(|error| format!("分配深度图像内存失败: {error}"));
+        let allocation = match allocation {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: image 由本设备创建且尚未绑定。
+                unsafe { self.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        };
+        // SAFETY: image 与 allocation.memory 由本设备创建，偏移在分配范围内。
+        if let Err(error) = unsafe {
+            self.device
+                .bind_image_memory(image, allocation.memory, allocation.offset)
+        }
+        .map_err(|error| format!("绑定深度图像内存失败: {error}"))
+        {
+            // SAFETY: image 由本设备创建且尚未绑定/绑定失败。
+            unsafe { self.device.destroy_image(image, None) };
+            self.allocator.free(&allocation);
+            return Err(error);
+        }
 
         let subresource = vk::ImageSubresourceRange::builder()
             .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1121,14 +1175,29 @@ impl VulkanCore {
             .format(format)
             .subresource_range(subresource);
         // SAFETY: image 与格式、子资源范围匹配。
-        let view = unsafe { self.device.create_image_view(&view_info, None) }
-            .map_err(|error| format!("创建深度图像视图失败: {error}"))?;
+        let view = match unsafe { self.device.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                // SAFETY: image 由本设备创建，尚无有效视图。
+                unsafe { self.device.destroy_image(image, None) };
+                self.allocator.free(&allocation);
+                return Err(format!("创建深度图像视图失败: {error}"));
+            }
+        };
 
-        self.transition_depth_layout(image, subresource)?;
+        if let Err(error) = self.transition_depth_layout(image, subresource) {
+            // SAFETY: view/image 由本设备创建且未被提交引用。
+            unsafe {
+                self.device.destroy_image_view(view, None);
+                self.device.destroy_image(image, None);
+            }
+            self.allocator.free(&allocation);
+            return Err(error);
+        }
 
         self.depth = Some(DepthResources {
             image,
-            memory,
+            allocation,
             view,
         });
         self.depth_format = Some(format);
@@ -1191,12 +1260,13 @@ impl VulkanCore {
 
     fn destroy_depth_resources(&mut self) {
         if let Some(depth) = self.depth.take() {
-            // SAFETY: 深度资源由本对象创建；调用方保证 GPU 空闲或资源未被提交引用。
+            // SAFETY: 深度资源由本对象创建；调用方保证 GPU 空闲或资源未被提交引用
+            // （仅在创建路径与 wait_idle 之后调用）。
             unsafe {
                 self.device.destroy_image_view(depth.view, None);
                 self.device.destroy_image(depth.image, None);
-                self.device.free_memory(depth.memory, None);
             }
+            self.allocator.free(&depth.allocation);
         }
     }
 
@@ -1239,19 +1309,55 @@ impl VulkanCore {
         self.meshes[index].generation = handle.generation().wrapping_add(1);
         self.free_meshes.push(index as u32);
         if let Some(mesh) = mesh {
-            self.release_mesh(mesh);
+            if self.frames.is_empty() {
+                // headless：无帧在飞行，上传路径已同步等待队列，立即释放安全。
+                self.release_mesh(mesh);
+            } else {
+                // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
+                // 在飞提交已完成（队列操作按提交序完成）。
+                let fence = self.frames[self.frame_index].fence;
+                self.deletions.push(DeletionEntry {
+                    fence,
+                    buffers: vec![
+                        (mesh.vertex_buffer, mesh.vertex_allocation),
+                        (mesh.index_buffer, mesh.index_allocation),
+                    ],
+                });
+            }
         }
         true
     }
 
-    fn release_mesh(&self, mesh: GpuMesh) {
-        // SAFETY: 网格缓冲由本设备创建，且调用方保证 GPU 侧不再使用（创建/销毁均同步）。
+    /// 立即销毁网格的 GPU 缓冲并归还显存（Drop / headless 路径）。
+    fn release_mesh(&mut self, mesh: GpuMesh) {
+        // SAFETY: 网格缓冲由本设备创建，且调用方保证 GPU 侧不再使用。
         unsafe {
             self.device.destroy_buffer(mesh.vertex_buffer, None);
-            self.device.free_memory(mesh.vertex_memory, None);
             self.device.destroy_buffer(mesh.index_buffer, None);
-            self.device.free_memory(mesh.index_memory, None);
         }
+        self.allocator.free(&mesh.vertex_allocation);
+        self.allocator.free(&mesh.index_allocation);
+    }
+
+    /// 冲销队列：销毁所有 fence 已匹配（或 `fence = None` 即全部）的延迟销毁条目。
+    ///
+    /// 帧循环在本帧 fence 等待返回后调用；`Drop` / 重建交换链在 `wait_idle` 后以
+    /// `None` 调用（此时全部提交已完成）。
+    fn flush_deletions(&mut self, fence: Option<vk::Fence>) {
+        let mut remaining = Vec::new();
+        for entry in self.deletions.drain(..) {
+            let due = fence.is_none_or(|fence| fence == entry.fence);
+            if due {
+                for (buffer, allocation) in entry.buffers {
+                    // SAFETY: 关联 fence 已信号，GPU 侧不再使用该缓冲。
+                    unsafe { self.device.destroy_buffer(buffer, None) };
+                    self.allocator.free(&allocation);
+                }
+            } else {
+                remaining.push(entry);
+            }
+        }
+        self.deletions = remaining;
     }
 
     fn destroy_all_meshes(&mut self) {
@@ -1266,13 +1372,16 @@ impl VulkanCore {
         }
     }
 
-    /// 分配 buffer 并绑定设备内存。
+    /// 分配 buffer 并绑定分配器子分配的设备内存（R-09：staging/UBO/网格统一入口）。
+    ///
+    /// `dedicated = true` 用于持久映射等特殊资源（相机 UBO）。
     fn create_buffer(
-        &self,
+        &mut self,
         size: u64,
         usage: vk::BufferUsageFlags,
         properties: vk::MemoryPropertyFlags,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        dedicated: bool,
+    ) -> Result<GpuBuffer, String> {
         let info = vk::BufferCreateInfo::builder()
             .size(size)
             .usage(usage)
@@ -1282,26 +1391,48 @@ impl VulkanCore {
             .map_err(|error| format!("创建缓冲失败: {error}"))?;
         // SAFETY: buffer 刚由本设备创建。
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = self.find_memory_type(requirements.memory_type_bits, properties)?;
-        let allocate_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type)
-            .build();
-        // SAFETY: 分配参数来自 buffer 的内存需求，内存类型已校验。
-        let memory = unsafe { self.device.allocate_memory(&allocate_info, None) }
-            .map_err(|error| format!("分配缓冲内存失败: {error}"))?;
-        // SAFETY: buffer 与 memory 由本设备创建，偏移 0 在分配范围内。
-        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
-            .map_err(|error| format!("绑定缓冲内存失败: {error}"))?;
-        Ok((buffer, memory))
+        let memory_type = match self.find_memory_type(requirements.memory_type_bits, properties) {
+            Ok(memory_type) => memory_type,
+            Err(error) => {
+                // SAFETY: buffer 由本设备创建且尚未绑定。
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+        let allocation = match self.allocator.alloc(
+            requirements.size,
+            requirements.alignment,
+            memory_type,
+            dedicated,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: buffer 由本设备创建且尚未绑定。
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(format!("分配缓冲内存失败: {error}"));
+            }
+        };
+        // SAFETY: buffer 与 allocation.memory 由本设备创建，偏移在分配范围内。
+        if let Err(error) = unsafe {
+            self.device
+                .bind_buffer_memory(buffer, allocation.memory, allocation.offset)
+        }
+        .map_err(|error| format!("绑定缓冲内存失败: {error}"))
+        {
+            // SAFETY: buffer 由本设备创建且已解绑/绑定失败，不再使用。
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            self.allocator.free(&allocation);
+            return Err(error);
+        }
+        Ok(GpuBuffer { buffer, allocation })
     }
 
-    fn release_buffer(&self, buffer: vk::Buffer, memory: vk::DeviceMemory) {
-        // SAFETY: buffer/memory 由本设备创建且不再被使用。
-        unsafe {
-            self.device.destroy_buffer(buffer, None);
-            self.device.free_memory(memory, None);
-        }
+    /// 立即销毁 buffer 并归还显存。仅用于调用点能证明 GPU 不再使用该缓冲的路径
+    /// （刚创建未使用 / 阻塞上传后 `queue_wait_idle` 已返回）；其余走 `DeletionQueue`。
+    fn release_buffer(&mut self, gpu: GpuBuffer) {
+        // SAFETY: buffer 由本设备创建且调用方保证 GPU 侧不再使用。
+        unsafe { self.device.destroy_buffer(gpu.buffer, None) };
+        self.allocator.free(&gpu.allocation);
     }
 
     /// 把字节上传到 device-local 缓冲（staging → transfer copy → 同步等待）。
@@ -1309,42 +1440,50 @@ impl VulkanCore {
         &mut self,
         bytes: &[u8],
         usage: vk::BufferUsageFlags,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+    ) -> Result<GpuBuffer, String> {
         let size = bytes.len() as u64;
-        let (staging, staging_memory) = self.create_buffer(
+        let staging = self.create_buffer(
             size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            false,
         )?;
-        // SAFETY: staging 内存为 HOST_VISIBLE|HOST_COHERENT，映射大小与 bytes 匹配。
+        // SAFETY: staging 内存为 HOST_VISIBLE|HOST_COHERENT，映射区间与 bytes 匹配；
+        // 该分配不在持久映射块中（相机 UBO 为 dedicated），unmap 不影响其他映射。
         unsafe {
             let mapped = self
                 .device
-                .map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_memory(
+                    staging.allocation.memory,
+                    staging.allocation.offset,
+                    size,
+                    vk::MemoryMapFlags::empty(),
+                )
                 .map_err(|error| format!("映射 staging 内存失败: {error}"))?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
-            self.device.unmap_memory(staging_memory);
+            self.device.unmap_memory(staging.allocation.memory);
         }
 
-        let (buffer, memory) = match self.create_buffer(
+        let buffer = match self.create_buffer(
             size,
             usage | vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            false,
         ) {
             Ok(created) => created,
             Err(error) => {
-                self.release_buffer(staging, staging_memory);
+                self.release_buffer(staging);
                 return Err(error);
             }
         };
 
-        let result = self.copy_buffer_blocking(staging, buffer, size);
-        // staging 只在拷贝期间需要。
-        self.release_buffer(staging, staging_memory);
+        let result = self.copy_buffer_blocking(staging.buffer, buffer.buffer, size);
+        // staging 只在拷贝期间需要；拷贝路径已等待队列空闲，可立即释放。
+        self.release_buffer(staging);
         match result {
-            Ok(()) => Ok((buffer, memory)),
+            Ok(()) => Ok(buffer),
             Err(error) => {
-                self.release_buffer(buffer, memory);
+                self.release_buffer(buffer);
                 Err(error)
             }
         }
@@ -1417,22 +1556,20 @@ impl VulkanCore {
         let vertex_bytes = vertices_as_bytes(&data.vertices);
         let index_bytes = indices_as_bytes(&data.indices);
 
-        let (vertex_buffer, vertex_memory) =
-            self.upload_bytes(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-        let (index_buffer, index_memory) =
-            match self.upload_bytes(index_bytes, vk::BufferUsageFlags::INDEX_BUFFER) {
-                Ok(created) => created,
-                Err(error) => {
-                    self.release_buffer(vertex_buffer, vertex_memory);
-                    return Err(error);
-                }
-            };
+        let vertex = self.upload_bytes(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let index = match self.upload_bytes(index_bytes, vk::BufferUsageFlags::INDEX_BUFFER) {
+            Ok(created) => created,
+            Err(error) => {
+                self.release_buffer(vertex);
+                return Err(error);
+            }
+        };
 
         Ok(GpuMesh {
-            vertex_buffer,
-            vertex_memory,
-            index_buffer,
-            index_memory,
+            vertex_buffer: vertex.buffer,
+            vertex_allocation: vertex.allocation,
+            index_buffer: index.buffer,
+            index_allocation: index.allocation,
             index_count: data.indices.len() as u32,
         })
     }
@@ -1957,10 +2094,13 @@ impl VulkanCore {
 
         // SAFETY: fence/semaphore/命令缓冲均有效且由本对象独占；等待上一轮该帧完成后再复用。
         unsafe {
-            let frame = &mut self.frames[frame_index];
+            let frame_fence = self.frames[frame_index].fence;
             self.device
-                .wait_for_fences(&[frame.fence], true, u64::MAX)
+                .wait_for_fences(&[frame_fence], true, u64::MAX)
                 .map_err(|error| format!("等待 GPU 完成失败: {error}"))?;
+            // 延迟回收（R-09）：本帧 fence 已信号，绑定它的销毁请求现在安全。
+            self.flush_deletions(Some(frame_fence));
+            let frame = &mut self.frames[frame_index];
             let (index, suboptimal) = match self.device.acquire_next_image_khr(
                 swapchain,
                 u64::MAX,
@@ -2266,6 +2406,8 @@ impl VulkanCore {
         // SAFETY: 等待所有已提交工作结束后再销毁交换链资源。
         unsafe { self.device.device_wait_idle() }
             .map_err(|error| format!("等待设备空闲失败: {error}"))?;
+        // 设备已空闲：顺带回收全部待销毁缓冲（R-09）。
+        self.flush_deletions(None);
         for view in self.image_views.drain(..) {
             // SAFETY: view 由本对象创建且尚未销毁。
             unsafe { self.device.destroy_image_view(view, None) };
@@ -2295,11 +2437,14 @@ impl VulkanCore {
 impl Drop for VulkanCore {
     fn drop(&mut self) {
         // SAFETY: 本对象仍持有有效的 Vulkan 句柄；先等待 GPU 空闲，再按
-        // frame → pipeline → image views → swapchain → surface → messenger → device → instance 逆序释放。
+        // deletion → frame → pipeline → image views → swapchain → surface → messenger
+        // → allocator → device → instance 逆序释放。
         unsafe {
             if !self.frames.is_empty() {
                 let _ = self.device.device_wait_idle();
             }
+            // 设备已空闲：延迟回收队列中的缓冲现在可以安全销毁（R-09）。
+            self.flush_deletions(None);
             for frame in self.frames.drain(..) {
                 for semaphore in frame.render_finished {
                     self.device.destroy_semaphore(semaphore, None);
@@ -2308,7 +2453,7 @@ impl Drop for VulkanCore {
                 self.device.destroy_fence(frame.fence, None);
                 // 持久映射随内存释放自动解除。
                 self.device.destroy_buffer(frame.camera_buffer, None);
-                self.device.free_memory(frame.camera_memory, None);
+                self.allocator.free(&frame.camera_allocation);
                 if let Some(pool) = frame.timestamp_pool {
                     self.device.destroy_query_pool(pool, None);
                 }
@@ -2337,6 +2482,8 @@ impl Drop for VulkanCore {
                 self.instance
                     .destroy_debug_utils_messenger_ext(messenger, None);
             }
+            // 分配器持有的全部块/dedicated 内存必须在销毁 device 之前释放（R-08）。
+            self.allocator.destroy_all();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }

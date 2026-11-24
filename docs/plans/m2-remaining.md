@@ -1,7 +1,7 @@
 # M2 剩余任务清单（多帧在飞行 → RenderGraph → 显存/管线基础设施 → 材质与 PBR）
 
-- 日期：2026-11-24（批次 A–D 于同日完成）
-- 状态：**批次 A–D 已完成**（R-01…R-07 落地；批次 E 起未开工）
+- 日期：2026-11-24（批次 A–D 于同日完成；批次 E 同日完成）
+- 状态：**批次 A–E 已完成**（R-01…R-10 落地；仅余批次 F：R-11…R-15 材质/PBR/剔除）
 - 关联：README §8.2（M2）、§8.3（v0.3 垂直切片）、§9.6、§14.4；ADR-0004（渲染管线与 RenderGraph）、
   ADR-0011（Slang，第 8 条多入口延后）、ADR-0012（帧数据/提交边界，第 5 条临时取舍）；`docs/plans/v0.2-cube.md`
 - 估算：**约 12.5 净人日**（批次 A 1.5 + B 3.5 + C 0.5 + D 1.0 + E 3.0 + F 5.0，含 0.5 冗余）
@@ -298,6 +298,14 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 | 管线缓存 | 重定向 `LOCALAPPDATA` 到工作区两次启动对比；损坏文件（3 字节）启动 | ✅ 首启「未命中→已写回 5404 字节」；二启「命中 5388 字节」（Gate 4）；损坏仅 warn 并重建 | 2026-11-24 |
 | 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 58.7 FPS，0 validation 消息 | 2026-11-24 |
 | headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常；headless 无缓存读写日志 | 2026-11-24 |
+| （批次 E 记录见 §10；以下为批次 E） | | | |
+| 单测 | `cargo test --workspace` | ✅ 全部套件 ok（`mir-render` 43 项，含 7 项分配器纯逻辑单测 + 2 项 GPU 压力单测），0 失败 | 2026-11-24 |
+| 分配器压力 | `mesh_create_destroy_loop_conserves_allocations_when_gpu_available`（1000 次 create/destroy） | ✅ 循环后 `allocated_bytes == 0`（Gate 5 泄漏守恒） | 2026-11-24 |
+| 交错大小 | `interleaved_mesh_sizes_leave_no_residual_allocation_when_gpu_available`（7 种大小交错创建/部分销毁/全部销毁） | ✅ 部分销毁后统计下降；全部销毁后归 0（Gate 5） | 2026-11-24 |
+| 格式/静态检查 | `cargo fmt --all -- --check`；`cargo clippy --workspace --all-targets -- -D warnings` | ✅ 通过（仅 Cargo 清单既有 unused dependency 警告） | 2026-11-24 |
+| 校验层 | `cargo run -- --validation --frames 120` | ✅ 0 validation 消息，57.9 FPS；深度图像/网格/staging/UBO 全部经分配器（Gate 5） | 2026-11-24 |
+| 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 57.9 FPS，0 validation 消息（与批次 D 基线 58.7 持平，vsync 波动内） | 2026-11-24 |
+| headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常（headless 走同步释放路径） | 2026-11-24 |
 
 ## 10. 执行记录
 
@@ -377,3 +385,25 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 - 本机沙箱直接写 `%LOCALAPPDATA%` 报 `os error 5` 时仅告警降级，渲染完全不受影响（容错路径实机验证）。
 
 下一步：批次 E（R-08 子分配器，关键路径）→ R-09 接管分配点 → R-10 压力验证 → 批次 F（材质/PBR/剔除）。
+
+### 2026-11-24：批次 E——自研显存子分配器（R-08/R-09/R-10 已完成）
+
+| 项 | 改动 |
+|---|---|
+| 分配器核心（R-08） | 新增 `crates/mir-render/src/allocator.rs`（crate 私有，不外泄 Vulkan 类型）：`MemoryAllocator` 按 memory type index 分桶（`buckets: Vec<Option<Bucket>>`），块分级 DEVICE_LOCAL 64/256 MB、HOST_VISIBLE 16/64 MB，块数上限 16/类型、单进程分配数上限 1024；块内 `FreeList` 空闲区间线性分配（first-fit）+ 相邻合并；全部子分配按 `max(requirements.alignment, bufferImageGranularity)` 对齐，支持块内 buffer/image 混布；dedicated 整块路径用于持久映射资源与超过最大块的请求；`alloc/free/allocated_bytes` API，`destroy_all` 幂等（`Drop` 兜底） |
+| 纯逻辑单测 | `FreeList` 独立 7 项单测：对齐（含非幂次 6）、区间拆分与耗尽、双侧相邻合并、非相邻留空隙、200 轮交错大小 FIFO 分配/释放后精确回到整块、块分级选择；`cargo test -p mir-render --lib allocator` 全过 |
+| 接管分配点（R-09） | 删除 `vulkan.rs` 中两处裸 `allocate_memory`（原深度图像 :1105、通用 buffer :1291）；`create_buffer` 改为返回 `GpuBuffer { buffer, allocation }` 并按 requirements 子分配/绑定 offset，staging/相机 UBO/网格顶点/索引全部收口同一入口；深度图像路径改经分配器（`bind_image_memory` 带 offset），失败路径逐级回收；相机 UBO 走 **dedicated**（持久映射不能与 staging 的 map/unmap 共享块），映射区间 `(memory, offset, size)` |
+| DeletionQueue（R-09） | 新增 `DeletionEntry { fence, buffers }`：`destroy_mesh` 在窗口模式下不再同步销毁，改为绑定**下一帧** fence（其信号保证所有更早在飞提交已完成，队列操作按提交序完成）入队；`render_frame` 在本帧 fence 等待返回后 `flush_deletions(Some(fence))`；`recreate_swapchain` 与 `Drop` 在 `device_wait_idle` 后 `flush_deletions(None)` 全量回收；headless（无帧资源）保持同步释放；`Drop` 在 `destroy_device` 前 `allocator.destroy_all()`，字段声明顺序保证兜底 `Drop` 安全 |
+| 压力验证（R-10） | `RenderContext::allocated_bytes()`（公共诊断 API，无 Vulkan 类型）+ 两项 GPU 单测：1000 次 cube create/destroy 循环后守恒归 0；7 种三角形数（1…256）交错创建 → 部分销毁（统计下降断言）→ 全部销毁归 0；无 GPU 环境显式跳过 |
+| 诊断 | `flush_deletions` 逐条 `SAFETY:` 注释；`Allocation` 字段私有（memory/offset/size 除外），`free` 凭 `type_index + block` 定位归还 |
+
+验证（2026-11-24）：
+
+- `cargo test -p mir-render`：43 项全过（含 2 项真机 GPU 压力单测）；`cargo test --workspace` 全绿。
+- `cargo run -- --validation --frames 120`：**0 validation 消息**，57.9 FPS（Gate 5）。
+- `cargo run --release -- --validation --frames 600 --width 1920 --height 1080`：600 帧完成，57.9 FPS，0 validation 消息（批次 D 基线 58.7，vsync 波动范围内）。
+- `cargo run --release -- --headless --frames 1000 --no-validation`：1000 帧完成，退出正常。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过（仅既有清单警告）。
+- 实现备注：vulkanalia 0.35 的 `Device` 为 `Clone`（分配器持有独立句柄）；`unmap_memory` 按整个 `vk::DeviceMemory` 生效——因此持久映射的相机 UBO 必须 dedicated，避免 staging map/unmap 影响。
+
+下一步：批次 F（R-11 材质描述符 → R-12 PBR 着色器/程序化几何 → R-13 Frustum/剔除 → R-14 验收 → R-15 文档）为 M2 剩余最后一批，完成后进入 M3（hecs/Actor/层级）。

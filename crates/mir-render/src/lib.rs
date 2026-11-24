@@ -2,12 +2,14 @@
 //!
 //! 公共 API 不暴露任何 Vulkan 类型；`VulkanCore` 完全封装在 crate 内部
 //! （ADR 0005 / README §5.1 规则 2）。当前已接入实例、物理设备、逻辑设备、
-//! 队列选择、surface、交换链、多帧在飞行（批次 A）与 RenderGraph v0.5
-//! （批次 B：声明式 pass/资源 + 编译期 barrier 推导 + GPU pass 时间戳 + 依赖图 dump）。
+//! 队列选择、surface、交换链、多帧在飞行（批次 A）、RenderGraph v0.5
+//! （批次 B：声明式 pass/资源 + 编译期 barrier 推导 + GPU pass 时间戳 + 依赖图 dump）
+//! 与自研显存子分配器（批次 E：分桶/块分级/空闲合并 + DeletionQueue 延迟回收）。
 //!
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
 
+mod allocator;
 mod frame;
 mod geometry;
 mod graph;
@@ -228,6 +230,12 @@ impl RenderContext {
             .unwrap_or(&[])
     }
 
+    /// 显存分配器当前未释放的子分配字节数（R-10 泄漏守恒诊断，可用于应用侧资源审计；
+    /// 无后端时为 `None`）。
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        self.backend.as_ref().map(VulkanCore::allocated_bytes)
+    }
+
     /// 当前渲染目标尺寸（随窗口缩放更新）。
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -431,5 +439,80 @@ mod tests {
         context.begin_frame([0.1, 0.1, 0.1, 1.0]);
         context.end_frame();
         assert!(context.frame_error().is_none());
+    }
+
+    /// 生成 n 个三角形的交错大小网格（R-10：交错大小分配）。
+    fn sized_mesh(triangles: usize) -> MeshData {
+        let mut vertices = Vec::with_capacity(triangles * 3);
+        let mut indices = Vec::with_capacity(triangles * 3);
+        for triangle in 0..triangles {
+            let base = triangle as f32 * 0.01;
+            let first = vertices.len() as u32;
+            for corner in 0..3_u32 {
+                vertices.push(Vertex::new(
+                    [base + corner as f32 * 0.1, base, 0.0],
+                    [0.2, 0.4, 0.8],
+                ));
+            }
+            indices.extend_from_slice(&[first, first + 1, first + 2]);
+        }
+        MeshData::new(vertices, indices)
+    }
+
+    #[test]
+    fn mesh_create_destroy_loop_conserves_allocations_when_gpu_available() {
+        // R-10：1000 次 create/destroy 循环后分配计数必须守恒（回到 0）。
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+        // 无 Vulkan 设备（CI/无 GPU）的环境显式跳过，保持测试可移植。
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let mesh = crate::cube();
+        for _ in 0..1000 {
+            let handle = context.create_mesh(&mesh).expect("上传网格");
+            context.destroy_mesh(handle);
+        }
+        assert_eq!(context.allocated_bytes(), Some(0), "循环后应无残留分配");
+    }
+
+    #[test]
+    fn interleaved_mesh_sizes_leave_no_residual_allocation_when_gpu_available() {
+        // R-10：交错大小的网格反复创建/部分销毁，最终全部销毁后应回到 0。
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let mut handles = Vec::new();
+        for triangles in [1, 64, 7, 256, 13, 128, 3] {
+            handles.push(
+                context
+                    .create_mesh(&sized_mesh(triangles))
+                    .expect("上传网格"),
+            );
+        }
+        let allocated = context.allocated_bytes().expect("有设备时分配器统计应存在");
+        assert!(allocated > 0, "存活网格应占用显存统计");
+
+        // 交错销毁一半（先取出另一半，避免 drain 丢句柄），统计应单调下降。
+        let survivors: Vec<_> = handles
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| position % 2 == 1)
+            .map(|(_, handle)| *handle)
+            .collect();
+        for handle in handles.drain(..).step_by(2) {
+            context.destroy_mesh(handle);
+        }
+        let after_half = context.allocated_bytes().expect("统计应存在");
+        assert!(after_half < allocated, "部分销毁后统计应下降");
+
+        for handle in survivors {
+            context.destroy_mesh(handle);
+        }
+        assert_eq!(context.allocated_bytes(), Some(0), "全部销毁后应无残留");
     }
 }
