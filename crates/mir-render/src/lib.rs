@@ -13,11 +13,13 @@ mod allocator;
 mod frame;
 mod geometry;
 mod graph;
+mod material;
 mod mesh;
 mod vulkan;
 
 pub use frame::{CameraFrame, InstanceData};
-pub use geometry::cube;
+pub use geometry::{cube, sphere, torus};
+pub use material::{MaterialData, MaterialHandle};
 pub use mesh::{MeshData, MeshHandle, Vertex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -52,6 +54,8 @@ pub enum RenderInitError {
     Transfer(String),
     #[error("Vulkan mesh upload failed: {0}")]
     Mesh(String),
+    #[error("Vulkan material creation failed: {0}")]
+    Material(String),
     #[error("renderer is not initialized")]
     NotInitialized,
     #[error("renderer is already initialized")]
@@ -270,9 +274,28 @@ impl RenderContext {
     }
 
     /// 提交一次绘制：网格句柄 + 实例数据（同一网格可提交多次）。
+    ///
+    /// 使用渲染层内置默认材质（白色 Lambert）；带材质的提交见 [`RenderContext::submit_with_material`]。
     pub fn submit(&mut self, mesh: MeshHandle, instance: InstanceData) {
         self.draws.push(frame::DrawInstance {
             mesh,
+            material: None,
+            data: instance,
+        });
+    }
+
+    /// 提交一次带材质的绘制：网格句柄 + 材质句柄 + 实例数据（R-11）。
+    ///
+    /// 材质句柄无效（已销毁/世代过期）时绘制回退到默认材质。
+    pub fn submit_with_material(
+        &mut self,
+        mesh: MeshHandle,
+        material: MaterialHandle,
+        instance: InstanceData,
+    ) {
+        self.draws.push(frame::DrawInstance {
+            mesh,
+            material: Some(material),
             data: instance,
         });
     }
@@ -280,6 +303,29 @@ impl RenderContext {
     /// 本帧收集到的绘制请求数量（测试/诊断）。
     pub fn submitted_instances(&self) -> usize {
         self.draws.len()
+    }
+
+    /// 创建材质：写入材质参数 UBO 并分配描述符（R-11）。
+    ///
+    /// headless 下同样可创建（不分配描述符，不会被绘制）。
+    pub fn create_material(
+        &mut self,
+        data: &MaterialData,
+    ) -> Result<MaterialHandle, RenderInitError> {
+        let backend = self
+            .backend
+            .as_mut()
+            .ok_or(RenderInitError::NotInitialized)?;
+        backend
+            .create_material(data)
+            .map_err(RenderInitError::Material)
+    }
+
+    /// 销毁材质；句柄无效或已销毁时为空操作（对齐 `destroy_mesh` 语义）。
+    pub fn destroy_material(&mut self, handle: MaterialHandle) {
+        if let Some(backend) = self.backend.as_mut() {
+            let _ = backend.destroy_material(handle);
+        }
     }
 
     /// 创建 GPU 网格：需要先完成渲染初始化（headless 下也可上传，只是不会被绘制）。
@@ -310,7 +356,7 @@ impl RenderContext {
                 self.clear_color,
                 self.width,
                 self.height,
-                self.camera.view_proj,
+                self.camera,
                 &self.draws,
             ) {
                 self.frame_error = Some(error);
@@ -452,6 +498,7 @@ mod tests {
                 vertices.push(Vertex::new(
                     [base + corner as f32 * 0.1, base, 0.0],
                     [0.2, 0.4, 0.8],
+                    [0.0, 0.0, 1.0],
                 ));
             }
             indices.extend_from_slice(&[first, first + 1, first + 2]);
@@ -514,5 +561,49 @@ mod tests {
             context.destroy_mesh(handle);
         }
         assert_eq!(context.allocated_bytes(), Some(0), "全部销毁后应无残留");
+    }
+
+    #[test]
+    fn materials_submit_and_destroy_without_panic_when_gpu_available() {
+        // R-11：headless 下多材质创建/提交/销毁不 panic，且分配守恒（Gate 6 验收路径）。
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        // 三种不同参数的材质（金属度/粗糙度对照，供 R-12 演示复用）。
+        let gold = MaterialData::new([1.0, 0.77, 0.34, 1.0], 1.0, 0.25, [0.0; 3]);
+        let plastic = MaterialData::new([0.8, 0.2, 0.2, 1.0], 0.0, 0.9, [0.0; 3]);
+        let glowing = MaterialData::new([0.1, 0.1, 0.1, 1.0], 0.0, 0.5, [0.2, 0.15, 0.1]);
+        let handles = [
+            context.create_material(&gold).expect("创建金属材质"),
+            context.create_material(&plastic).expect("创建塑料材质"),
+            context.create_material(&glowing).expect("创建自发光材质"),
+        ];
+        assert_ne!(handles[0], handles[1]);
+
+        let mesh = context.create_mesh(&crate::cube()).expect("上传立方体网格");
+        context.begin_frame([0.0, 0.0, 0.0, 1.0]);
+        context.set_camera(CameraFrame::default());
+        for handle in handles {
+            context.submit_with_material(mesh, handle, InstanceData::default());
+        }
+        context.submit(mesh, InstanceData::default()); // 默认材质路径
+        assert_eq!(context.submitted_instances(), 4);
+        // headless 下 end_frame 为空操作；窗口路径由验收（R-14）覆盖。
+        context.end_frame();
+        assert!(context.frame_error().is_none());
+
+        // 旧句柄重复销毁为空操作；槽位复用后世代号递增。
+        for handle in handles {
+            context.destroy_material(handle);
+        }
+        context.destroy_material(handles[0]);
+        let reused = context.create_material(&plastic).expect("复用槽位创建材质");
+        assert_ne!(reused, handles[0], "世代号应使旧句柄失效");
+        context.destroy_material(reused);
+        context.destroy_mesh(mesh);
+        assert_eq!(context.allocated_bytes(), Some(0), "全部销毁后应无残留分配");
     }
 }

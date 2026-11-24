@@ -465,10 +465,10 @@ Miriya/
 | crate | 现状 | 成熟度 | 下一步（里程碑） |
 |---|---|---|---|
 | `mir-core` | `EngineConfig`（含 `validation`）/主循环、帧率限制、日志初始化 | 🟡 原型 | 拆 `EngineLoop`/`FramePipeline`、插件与退出资源（M2–M3） |
-| `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
+| `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`、`Aabb`/`Frustum`（六平面提取 + p-vertex 包围盒测试），含测试 | 🟡 原型 | `Transform` 收敛到本 crate、坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
-| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants/10 实例绘制、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化、自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收） | 🟡 原型 | 材质/PBR（M2 批次 F/M5） |
+| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化、自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统（per-material UBO + 世代句柄）、基础 PBR（GGX metallic-roughness + 单方向光）、视锥剔除（extract 侧） | 🟡 原型 | 多光源/纹理/IBL、glTF 资产（M4/M5） |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene`、`Transform`（含旋转/TRS）、UI 无关的自由相机与控制器 | 🟡 原型 | Level/Actor/层级/组件（M3） |
@@ -646,8 +646,9 @@ Miriya/
 
 - **后端**：Vulkan 1.3，通过 **`vulkanalia`**。`mir-render` 内部负责实例、物理设备选择、队列、交换链、
   描述符池/布局、管线、显存、命令缓冲与同步；公共 API 不出现 Vulkan 类型。
-- **帧数据边界（ADR-0012）**：应用层提取 `CameraFrame` / `InstanceData` 后提交，`mir-render` 不依赖场景或 ECS；
-  相机放 UBO、逐实例数据放 push constants。v0.2 仍是单帧在飞行，多帧/子分配器为 M2 剩余。
+- **帧数据边界（ADR-0012）**：应用层提取 `CameraFrame`（view_proj + 相机位置）/ `InstanceData` 后提交，
+  `mir-render` 不依赖场景或 ECS；相机放 UBO（set 0）、材质参数放 set 1 UBO、逐实例数据放 push constants。
+  视锥剔除发生在应用层 extract（`mir-math::Frustum`/`Aabb`），渲染层不感知剔除。
 - **特性**：动态渲染（dynamic rendering）、synchronization2、timeline semaphore、descriptor indexing；
   调试构建启用 Khronos validation layer；发布版持久化 pipeline cache 降低首帧卡顿。
 - **帧结构**：2–3 帧在飞行、环形暂存缓冲、**自研显存子分配器**（块/池/延迟回收，基于 `vulkanalia` 的显存类型，
@@ -1051,6 +1052,12 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   （绑定帧 fence）；深度/网格/staging/UBO 全部分配点收口，删除两处裸 `allocate_memory`；
   1000 次 create/destroy 循环与交错大小压力单测守恒归 0；校验层 0 error，
   release 1080p 600 帧 57.9 FPS。
+- [x] **M2 批次 F（材质/PBR/剔除，M2 剩余全部达成）**：`MaterialData`（std140 48 B）+
+  `MaterialHandle` 世代句柄 + per-material UBO（set 1，dedicated 分配，描述符集经 DeletionQueue 归还）；
+  `shaders/pbr/pbr.slang`（GGX metallic-roughness + 单方向光 + 固定半球环境项）切换主管线；
+  `Vertex` 增法线（stride 36）+ `sphere()`/`torus()` 程序化几何；`mir-math::Frustum`/`Aabb`
+  extract 侧视锥剔除（背对场景提交 11→0）；演示场景升级为 metallic/roughness 梯度阵列 +
+  金属圆环 + 自发光球；release 1080p 600 帧 58.6 FPS、校验层 0 error。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
@@ -1058,7 +1065,8 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
 3. `mir-render` 已具备深度、网格、逐实例绘制、校验层、多帧在飞行、RenderGraph v0.5、单 `.spv` 多入口、
-   持久化管线缓存与自研显存子分配器（批次 A–E 完成），但尚无材质/PBR 与视锥剔除（M2 批次 F）。
+   持久化管线缓存、自研显存子分配器、材质系统、基础 PBR 与视锥剔除（M2 批次 A–F 全部完成）；
+   多光源/纹理采样/IBL 为 M5，glTF 资产导入为 M4。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化且已推送到 `origin/main`；本地工作区需随每次里程碑同步提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
@@ -1095,8 +1103,10 @@ cargo run -p mir-vulkan-probe
 # 单 .spv 多入口：-fvk-use-entrypoint-name 保留 vertexMain/fragmentMain 入口名
 slangc shaders/hello/triangle.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/hello/triangle.spv
 slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
+slangc shaders/pbr/pbr.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/pbr/pbr.spv
 spirv-val shaders/hello/triangle.spv
 spirv-val shaders/cube/cube.spv
+spirv-val shaders/pbr/pbr.spv
 ```
 
 `cargo check --workspace`、`cargo test --workspace`、`cargo fmt --all -- --check` 与
@@ -1113,10 +1123,10 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 - [x] M2 / v0.2 Cube：深度、交换链健壮性、网格上传、cube 着色器与管线、10 实例提交、自由相机、
       代码内校验层 + `mir-log` 桥接、release 悬垂指针修复、CI 双 shader 校验；详见
       `docs/plans/v0.2-cube.md` §9/§10。
-- [ ] **M2 剩余**：RenderGraph v0.5、2–3 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存、
-      自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）
-      ✅ 已完成（批次 A–E，2026-11-24）；尚余网格/材质系统与基础 PBR
-      （批次 F，v0.3 前置）；任务清单与验收 Gate 见 `docs/plans/m2-remaining.md`。
+- [x] **M2 剩余（M2 全部达成）**：RenderGraph v0.5、2 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存、
+      自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统与基础 PBR、
+      `mir-math::Frustum`/`Aabb` 视锥剔除——批次 A–F 全部完成（2026-11-24）；
+      任务清单与验收 Gate 见 `docs/plans/m2-remaining.md` §9/§10。
 - [ ] **M3**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene` 收敛到 `mir-math`
       并按 ADR-0012 校准演示单位（米 → 厘米）。
 - [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。

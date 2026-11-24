@@ -31,7 +31,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
+          slangc shaders/pbr/pbr.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/pbr/pbr.spv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv shaders/pbr/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +84,8 @@ jobs:
         run: |
           slangc shaders/hello/triangle.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/hello/triangle.spv
           slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
-          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
+          slangc shaders/pbr/pbr.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/pbr/pbr.spv
+          git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv shaders/pbr/*.spv
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -16,10 +16,10 @@ use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
 use crate::allocator::{Allocation, MemoryAllocator};
-use crate::frame::DrawInstance;
+use crate::frame::{CameraFrame, DrawInstance};
 use crate::graph;
+use crate::material::{MaterialData, MaterialHandle, material_data_bytes};
 use crate::mesh::{MeshData, MeshHandle, Vertex, indices_as_bytes, vertices_as_bytes};
-use mir_math::Mat4;
 
 const API_VERSION: u32 = vk::make_version(1, 3, 0);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -210,7 +210,10 @@ struct FrameResources {
 struct PipelineResources {
     /// 单 `.spv` 多入口模块（`vertexMain`/`fragmentMain`），两个 stage 共用。
     shader_module: vk::ShaderModule,
+    /// set 0：相机 UBO（每帧一个集合）。
     descriptor_set_layout: vk::DescriptorSetLayout,
+    /// set 1：材质参数 UBO（R-11，每材质一个集合）。
+    material_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     /// 每帧一个相机 UBO 描述符集，按下标与 `VulkanCore::frames` 对齐。
     descriptor_sets: Vec<vk::DescriptorSet>,
@@ -224,6 +227,7 @@ struct PipelineGuard<'a> {
     device: &'a Device,
     shader_module: Option<vk::ShaderModule>,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
+    material_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
@@ -237,6 +241,7 @@ impl PipelineGuard<'_> {
     ) -> (
         vk::ShaderModule,
         vk::DescriptorSetLayout,
+        vk::DescriptorSetLayout,
         vk::DescriptorPool,
         vk::PipelineLayout,
         vk::Pipeline,
@@ -244,6 +249,9 @@ impl PipelineGuard<'_> {
         (
             self.shader_module.take().expect("着色器模块已创建"),
             self.descriptor_set_layout.take().expect("描述符布局已创建"),
+            self.material_set_layout
+                .take()
+                .expect("材质描述符布局已创建"),
             self.descriptor_pool.take().expect("描述符池已创建"),
             self.pipeline_layout.take().expect("管线布局已创建"),
             self.pipeline.take().expect("图形管线已创建"),
@@ -267,6 +275,9 @@ impl Drop for PipelineGuard<'_> {
             if let Some(layout) = self.descriptor_set_layout.take() {
                 self.device.destroy_descriptor_set_layout(layout, None);
             }
+            if let Some(layout) = self.material_set_layout.take() {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
             if let Some(module) = self.shader_module.take() {
                 self.device.destroy_shader_module(module, None);
             }
@@ -274,8 +285,16 @@ impl Drop for PipelineGuard<'_> {
     }
 }
 
-/// 相机 UBO（binding 0）：`view_proj`（4 × 4 f32）。
-const CAMERA_UBO_SIZE: u64 = 64;
+/// 相机 UBO（set 0 / binding 0）：`view_proj`（64 B）+ `camera_position`（std140 vec3，
+/// 偏移 64，含补齐共 80 B，R-12）。
+const CAMERA_UBO_SIZE: u64 = 80;
+
+/// 材质 UBO（set 1 / binding 0）：std140 布局的 [`MaterialData`]（R-11）。
+const MATERIAL_UBO_SIZE: u64 = std::mem::size_of::<MaterialData>() as u64;
+
+/// 材质槽位上限：决定描述符池容量（每材质 1 个 set 1 描述符集）。
+/// 超出上限后 `create_material` 返回错误；材质销毁会把槽位与描述符集归还复用。
+const MAX_MATERIALS: usize = 64;
 
 /// 逐实例 push constants：`model` + `tint`，共 80 字节（低于 128 字节下限）。
 #[repr(C)]
@@ -328,12 +347,30 @@ struct GpuMesh {
 struct DeletionEntry {
     fence: vk::Fence,
     buffers: Vec<(vk::Buffer, Allocation)>,
+    /// 材质描述符集（R-11）：同 fence 信号后归还描述符池
+    /// （池创建时带 FREE_DESCRIPTOR_SET_BIT）。
+    descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
 /// 网格槽位：世代号用于让销毁后的旧 [`MeshHandle`] 自动失效。
 struct MeshSlot {
     generation: u32,
     mesh: Option<GpuMesh>,
+}
+
+/// 一个已就绪的 GPU 材质：参数 UBO（HOST_VISIBLE|COHERENT，dedicated 整块分配，
+/// 因为创建时要 map/unmap，不能与 staging 共享同一 DeviceMemory）+ set 1 描述符集。
+struct GpuMaterial {
+    buffer: vk::Buffer,
+    allocation: Allocation,
+    /// set 1 描述符集；headless（无描述符池）时为 null，且不会被绘制路径引用。
+    descriptor_set: vk::DescriptorSet,
+}
+
+/// 材质槽位：世代号用于让销毁后的旧 [`MaterialHandle`] 自动失效（风格对齐 [`MeshSlot`]）。
+struct MaterialSlot {
+    generation: u32,
+    material: Option<GpuMaterial>,
 }
 
 /// Vulkan 核心对象。按 frame → pipeline → image views → swapchain → surface → device → instance 的逆序销毁。
@@ -368,6 +405,12 @@ pub(super) struct VulkanCore {
     transfer_command_buffer: vk::CommandBuffer,
     meshes: Vec<MeshSlot>,
     free_meshes: Vec<u32>,
+    /// 材质槽位表（R-11）与空闲槽位（复用时世代号递增）。
+    materials: Vec<MaterialSlot>,
+    free_materials: Vec<u32>,
+    /// 默认材质（白色 Lambert）：随 `init_pipeline` 创建，绘制路径在材质句柄
+    /// 无效/未提供时回退到它。
+    default_material: Option<GpuMaterial>,
     /// 待销毁的 GPU 缓冲（R-09）：绑定帧 fence 延迟回收。
     deletions: Vec<DeletionEntry>,
     /// 显存子分配器（R-08）：声明在 `device` 之前，保证字段 Drop 顺序安全。
@@ -743,6 +786,9 @@ impl VulkanCore {
             transfer_command_buffer,
             meshes: Vec::new(),
             free_meshes: Vec::new(),
+            materials: Vec::new(),
+            free_materials: Vec::new(),
+            default_material: None,
             deletions: Vec::new(),
             allocator,
             graphics_family,
@@ -1322,6 +1368,7 @@ impl VulkanCore {
                         (mesh.vertex_buffer, mesh.vertex_allocation),
                         (mesh.index_buffer, mesh.index_allocation),
                     ],
+                    descriptor_sets: Vec::new(),
                 });
             }
         }
@@ -1353,6 +1400,19 @@ impl VulkanCore {
                     unsafe { self.device.destroy_buffer(buffer, None) };
                     self.allocator.free(&allocation);
                 }
+                // 材质描述符集（R-11）：GPU 已不再引用，归还描述符池复用。
+                // 池在 destroy_pipeline 中先于本调用（Drop 顺序：flush_deletions 在前）。
+                if !entry.descriptor_sets.is_empty()
+                    && let Some(resources) = &self.pipeline
+                {
+                    // SAFETY: 池创建时带 FREE_DESCRIPTOR_SET_BIT，集合均属于该池且不再被引用。
+                    unsafe {
+                        let _ = self.device.free_descriptor_sets(
+                            resources.descriptor_pool,
+                            &entry.descriptor_sets,
+                        );
+                    }
+                }
             } else {
                 remaining.push(entry);
             }
@@ -1369,6 +1429,196 @@ impl VulkanCore {
             .collect();
         for mesh in meshes {
             self.release_mesh(mesh);
+        }
+    }
+
+    /// 创建 GPU 材质（R-11）：参数写入专用 UBO（dedicated 分配，创建时 map/unmap），
+    /// 管线就绪时分配 set 1 描述符集。
+    ///
+    /// headless（无管线）同样可创建：句柄有效但不分配描述符集，不会被绘制。
+    pub(super) fn create_material(
+        &mut self,
+        data: &MaterialData,
+    ) -> Result<MaterialHandle, String> {
+        let buffer = self.create_buffer(
+            MATERIAL_UBO_SIZE,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            true,
+        )?;
+        let bytes = material_data_bytes(data);
+        // 写入参数：HOST_COHERENT 无需 flush；dedicated 整块保证 map/unmap 不影响
+        // 同块内的 staging 等其他子分配（unmap_memory 按整个 DeviceMemory 生效）。
+        let mapped = unsafe {
+            self.device.map_memory(
+                buffer.allocation.memory,
+                buffer.allocation.offset,
+                MATERIAL_UBO_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
+        };
+        match mapped {
+            Ok(mapped) => unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+                self.device.unmap_memory(buffer.allocation.memory);
+            },
+            Err(error) => {
+                // SAFETY: buffer 刚创建且 GPU 侧从未使用，立即释放安全。
+                unsafe { self.device.destroy_buffer(buffer.buffer, None) };
+                self.allocator.free(&buffer.allocation);
+                return Err(format!("映射材质 UBO 失败: {error}"));
+            }
+        }
+
+        // 管线就绪时分配 set 1 描述符集并写入绑定（命名数组模式，见相机 UBO 写入）。
+        let descriptor_set = match &self.pipeline {
+            Some(resources) => {
+                let allocate_layouts = [resources.material_set_layout];
+                let allocate_info = vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(resources.descriptor_pool)
+                    .set_layouts(&allocate_layouts);
+                // SAFETY: 池与材质布局有效。
+                let sets = match unsafe { self.device.allocate_descriptor_sets(&allocate_info) } {
+                    Ok(sets) => sets,
+                    Err(error) => {
+                        // SAFETY: buffer 刚创建且 GPU 侧从未使用，立即释放安全。
+                        unsafe { self.device.destroy_buffer(buffer.buffer, None) };
+                        self.allocator.free(&buffer.allocation);
+                        return Err(format!("分配材质描述符集失败: {error}"));
+                    }
+                };
+                let set = sets
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "材质描述符集分配结果为空".to_string())?;
+                let material_infos = [vk::DescriptorBufferInfo::builder()
+                    .buffer(buffer.buffer)
+                    .offset(0)
+                    .range(MATERIAL_UBO_SIZE)
+                    .build()];
+                // 必须命名中间数组：`WriteDescriptorSet` 保存的是指针，临时数组会在语句结束即失效。
+                let material_write = vk::WriteDescriptorSet::builder()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&material_infos)
+                    .build();
+                let material_writes = [material_write];
+                // SAFETY: material_writes / material_infos 为命名数组，调用期间有效。
+                unsafe {
+                    let no_copies: [vk::CopyDescriptorSet; 0] = [];
+                    self.device
+                        .update_descriptor_sets(&material_writes, &no_copies);
+                }
+                set
+            }
+            // headless：无描述符池，null 集合不会被绘制路径引用。
+            None => vk::DescriptorSet::null(),
+        };
+
+        let gpu = GpuMaterial {
+            buffer: buffer.buffer,
+            allocation: buffer.allocation,
+            descriptor_set,
+        };
+
+        let index = self
+            .free_materials
+            .pop()
+            .unwrap_or(self.materials.len() as u32);
+        let generation = self
+            .materials
+            .get(index as usize)
+            .map(|slot| slot.generation)
+            .unwrap_or(0);
+        let slot = MaterialSlot {
+            generation,
+            material: Some(gpu),
+        };
+        if index as usize == self.materials.len() {
+            self.materials.push(slot);
+        } else {
+            self.materials[index as usize] = slot;
+        }
+        Ok(MaterialHandle::from_parts(index, generation))
+    }
+
+    /// 创建默认材质（白色 Lambert），绘制路径的兜底。随 `init_pipeline` 调用，
+    /// 此时描述符池已就绪。
+    fn create_default_material(&mut self) -> Result<(), String> {
+        let handle = self.create_material(&MaterialData::default())?;
+        let index = handle.index();
+        self.default_material = Some(
+            self.materials[index]
+                .material
+                .take()
+                .expect("默认材质槽位刚创建"),
+        );
+        // 该槽位永久保留（世代号不递增），不会再被复用——默认材质不走句柄表。
+        Ok(())
+    }
+
+    /// 销毁材质；句柄无效或世代不匹配时返回 `false`（旧句柄不会误删新材质）。
+    ///
+    /// 缓冲经 DeletionQueue 延迟回收；描述符集在 fence 信号后归还描述符池。
+    pub(super) fn destroy_material(&mut self, handle: MaterialHandle) -> bool {
+        let index = handle.index();
+        let Some(slot) = self.materials.get(index) else {
+            return false;
+        };
+        if slot.generation != handle.generation() {
+            return false;
+        }
+
+        let material = self.materials[index].material.take();
+        self.materials[index].generation = handle.generation().wrapping_add(1);
+        self.free_materials.push(index as u32);
+        if let Some(material) = material {
+            if self.frames.is_empty() {
+                // headless：无帧在飞行，参数 UBO 创建后未被 GPU 引用，立即释放安全。
+                self.release_material(material);
+            } else {
+                // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
+                // 在飞提交已完成（队列操作按提交序完成）。
+                let fence = self.frames[self.frame_index].fence;
+                self.deletions.push(DeletionEntry {
+                    fence,
+                    buffers: vec![(material.buffer, material.allocation)],
+                    descriptor_sets: vec![material.descriptor_set],
+                });
+            }
+        }
+        true
+    }
+
+    /// 立即销毁材质的 GPU 缓冲并归还显存（Drop / headless 路径）。
+    /// 描述符集随描述符池销毁一并释放（Drop 前 `flush_deletions` 会先归还可达的集合）。
+    fn release_material(&mut self, material: GpuMaterial) {
+        // SAFETY: 材质缓冲由本设备创建，且调用方保证 GPU 侧不再使用。
+        unsafe {
+            self.device.destroy_buffer(material.buffer, None);
+        }
+        self.allocator.free(&material.allocation);
+    }
+
+    /// 解析材质句柄；世代号不匹配（已被销毁/复用）时返回 `None`。
+    fn material_lookup(materials: &[MaterialSlot], handle: MaterialHandle) -> Option<&GpuMaterial> {
+        let slot = materials.get(handle.index())?;
+        if slot.generation != handle.generation() {
+            return None;
+        }
+        slot.material.as_ref()
+    }
+
+    /// Drop 收尾：释放全部存活材质的缓冲（描述符集随池销毁）。
+    fn destroy_all_materials(&mut self) {
+        let materials: Vec<GpuMaterial> = self
+            .materials
+            .iter_mut()
+            .filter_map(|slot| slot.material.take())
+            .collect();
+        for material in materials {
+            self.release_material(material);
         }
     }
 
@@ -1575,10 +1825,11 @@ impl VulkanCore {
     }
 
     fn init_pipeline(&mut self) -> Result<(), String> {
-        // 单 .spv 多入口（R-06）：`cube.spv` 经 `-fvk-use-entrypoint-name` 编译，
-        // 同时包含 vertexMain/fragmentMain 两个入口，两个 stage 共用同一模块。
+        // 单 .spv 多入口（R-06/R-12）：`pbr.slang` 经 `-fvk-use-entrypoint-name` 编译，
+        // 同时包含 vertexMain/fragmentMain 两个入口，两个 stage 共用同一模块；
+        // 材质 UBO（set 1）与法线输入自 R-12 起启用。
         const SHADER_CODE: &[u32] =
-            vulkanalia::include_shader_code!("../../../shaders/cube/cube.spv");
+            vulkanalia::include_shader_code!("../../../shaders/pbr/pbr.spv");
 
         // 管线缓存（R-07）：常驻 VkPipelineCache + 磁盘持久化；全部失败路径仅告警降级。
         let state_hash = pipeline_state_hash(SHADER_CODE);
@@ -1590,6 +1841,7 @@ impl VulkanCore {
             device: &self.device,
             shader_module: None,
             descriptor_set_layout: None,
+            material_set_layout: None,
             descriptor_pool: None,
             pipeline_layout: None,
             pipeline: None,
@@ -1616,7 +1868,7 @@ impl VulkanCore {
                 .build(),
         ];
 
-        // 顶点布局：位置 @0、颜色 @1，stride 24（与 `Vertex` 一致）。
+        // 顶点布局：位置 @0、颜色 @1、法线 @2（R-12），stride 36（与 `Vertex` 一致）。
         let vertex_binding = vk::VertexInputBindingDescription::builder()
             .binding(0)
             .stride(Vertex::SIZE as u32)
@@ -1634,6 +1886,12 @@ impl VulkanCore {
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(12)
+                .build(),
+            vk::VertexInputAttributeDescription::builder()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(24)
                 .build(),
         ];
         let vertex_bindings = [vertex_binding];
@@ -1685,12 +1943,12 @@ impl VulkanCore {
             .dynamic_states(&dynamic_states)
             .build();
 
-        // 描述符集 0 / binding 0：相机 UBO。
+        // 描述符集 0 / binding 0：相机 UBO（片元阶段读 camera_position 做 PBR 高光）。
         let ubo_binding = vk::DescriptorSetLayoutBinding::builder()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX);
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
         let descriptor_bindings = [ubo_binding];
         let descriptor_layout_info =
             vk::DescriptorSetLayoutCreateInfo::builder().bindings(&descriptor_bindings);
@@ -1702,13 +1960,33 @@ impl VulkanCore {
         .map_err(|error| format!("创建描述符布局失败: {error}"))?;
         guard.descriptor_set_layout = Some(descriptor_set_layout);
 
+        // 描述符集 1 / binding 0：材质参数 UBO（R-11），片元阶段读取。
+        let material_binding = vk::DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let material_bindings = [material_binding];
+        let material_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::builder().bindings(&material_bindings);
+        // SAFETY: 绑定描述有效。
+        let material_set_layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&material_layout_info, None)
+        }
+        .map_err(|error| format!("创建材质描述符布局失败: {error}"))?;
+        guard.material_set_layout = Some(material_set_layout);
+
+        // 池容量：每帧 1 个相机集合 + 每材质 1 个材质集合。
+        // 带 FREE_DESCRIPTOR_SET_BIT：材质销毁后描述符集经 DeletionQueue 归还复用。
         let pool_sizes = [vk::DescriptorPoolSize {
             type_: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+            descriptor_count: (MAX_FRAMES_IN_FLIGHT + MAX_MATERIALS) as u32,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::builder()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .pool_sizes(&pool_sizes)
-            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+            .max_sets((MAX_FRAMES_IN_FLIGHT + MAX_MATERIALS) as u32);
         // SAFETY: 池大小与最大集合数有效。
         let descriptor_pool = unsafe { self.device.create_descriptor_pool(&pool_info, None) }
             .map_err(|error| format!("创建描述符池失败: {error}"))?;
@@ -1768,11 +2046,11 @@ impl VulkanCore {
             .size(PUSH_CONSTANT_SIZE)
             .build();
         let push_ranges = [push_range];
-        let single_layouts = [descriptor_set_layout];
+        let set_layouts = [descriptor_set_layout, material_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&single_layouts)
+            .set_layouts(&set_layouts)
             .push_constant_ranges(&push_ranges);
-        // SAFETY: layout_info 有效：1 个描述符集 + 80 字节 push constants。
+        // SAFETY: layout_info 有效：2 个描述符集（相机 + 材质）+ 80 字节 push constants。
         let layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(|error| format!("创建管线布局失败: {error}"))?;
         guard.pipeline_layout = Some(layout);
@@ -1816,16 +2094,26 @@ impl VulkanCore {
         guard.pipeline = Some(pipeline);
 
         // 全部对象创建成功：从守卫移交所有权。
-        let (shader_module, descriptor_set_layout, descriptor_pool, layout, pipeline) =
-            guard.defuse();
+        let (
+            shader_module,
+            descriptor_set_layout,
+            material_set_layout,
+            descriptor_pool,
+            layout,
+            pipeline,
+        ) = guard.defuse();
         self.pipeline = Some(PipelineResources {
             shader_module,
             descriptor_set_layout,
+            material_set_layout,
             descriptor_pool,
             descriptor_sets,
             layout,
             pipeline,
         });
+        // 默认材质（白色 Lambert）：绘制路径的兜底集合。失败时管线本身已可用，
+        // 只在首次绘制时才会缺 set 1——直接报错让调用方走整体回收更简单。
+        self.create_default_material()?;
         // 管线创建成功后写回缓存（R-07）；IO 失败仅告警，不阻塞。
         if self.pipeline_cache.is_some() {
             self.save_pipeline_cache(cache_key, cache_path.as_deref());
@@ -1958,6 +2246,10 @@ impl VulkanCore {
     }
 
     fn destroy_pipeline(&mut self) {
+        // 默认材质：缓冲随本处销毁（描述符集随下方描述符池销毁一并释放）。
+        if let Some(material) = self.default_material.take() {
+            self.release_material(material);
+        }
         if let Some(resources) = self.pipeline.take() {
             // SAFETY: 这些对象由本对象创建且尚未销毁；调用方保证 GPU 已空闲。
             // 相机 UBO 属于每帧资源，随帧资源销毁，不在这里释放。
@@ -1968,6 +2260,8 @@ impl VulkanCore {
                     .destroy_descriptor_pool(resources.descriptor_pool, None);
                 self.device
                     .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
+                self.device
+                    .destroy_descriptor_set_layout(resources.material_set_layout, None);
                 self.device
                     .destroy_shader_module(resources.shader_module, None);
             }
@@ -2061,7 +2355,7 @@ impl VulkanCore {
     ///
     /// 交换链失效（`OUT_OF_DATE`）不视为帧错误：标记后本帧跳过，下一帧开头按当前窗口尺寸重建。
     /// `width` / `height` 是应用层已知的窗口尺寸，用于重建时取最新目标大小；
-    /// `view_proj` 是本帧相机，`draws` 是应用层提交的实例列表。
+    /// `camera` 是本帧相机（view_proj + 世界位置），`draws` 是应用层提交的实例列表。
     ///
     /// 帧资源按 `frame_index` 环形复用（[`MAX_FRAMES_IN_FLIGHT`] 帧在飞行）：
     /// 复用前等待本帧 fence，保证上一轮该帧的 GPU 工作（含 UBO 读取）已完成。
@@ -2070,7 +2364,7 @@ impl VulkanCore {
         clear_color: [f32; 4],
         width: u32,
         height: u32,
-        view_proj: Mat4,
+        camera: CameraFrame,
         draws: &[DrawInstance],
     ) -> Result<(), String> {
         if self.surface.is_none() {
@@ -2263,11 +2557,17 @@ impl VulkanCore {
 
                             // 相机 UBO：写入当前帧的持久映射。
                             // 本帧 fence 等待已保证上一轮该帧的 GPU 读取结束，HOST_COHERENT 无需 flush。
-                            let camera_matrix = view_proj.to_cols_array();
+                            // std140 布局：view_proj（64 B）+ camera_position（16 B，含 vec3 补齐）。
+                            let camera_matrix = camera.view_proj.to_cols_array();
+                            let mut camera_position = [0.0_f32; 4];
+                            camera_position[..3].copy_from_slice(&camera.camera_position);
+                            let mut camera_ubo = [0.0_f32; 20];
+                            camera_ubo[..16].copy_from_slice(&camera_matrix);
+                            camera_ubo[16..].copy_from_slice(&camera_position);
                             // SAFETY: camera_mapped 是创建时 map_memory 得到的持久映射指针，
                             // 有效范围 CAMERA_UBO_SIZE 字节，仅由本对象独占访问。
                             std::ptr::copy_nonoverlapping(
-                                camera_matrix.as_ptr().cast::<u8>(),
+                                camera_ubo.as_ptr().cast::<u8>(),
                                 frame.camera_mapped,
                                 CAMERA_UBO_SIZE as usize,
                             );
@@ -2282,10 +2582,34 @@ impl VulkanCore {
                                 &[],
                             );
 
+                            // set 1（材质）：按需换绑——材质句柄无效或未提供时回退默认材质。
+                            let mut bound_material_set = vk::DescriptorSet::null();
                             for draw in draws {
                                 let Some(mesh) = Self::mesh_lookup(&self.meshes, draw.mesh) else {
                                     continue;
                                 };
+                                let material_set = match draw.material.and_then(|handle| {
+                                    Self::material_lookup(&self.materials, handle)
+                                }) {
+                                    Some(material) => material.descriptor_set,
+                                    None => {
+                                        self.default_material
+                                            .as_ref()
+                                            .expect("默认材质随管线初始化创建")
+                                            .descriptor_set
+                                    }
+                                };
+                                if material_set != bound_material_set {
+                                    self.device.cmd_bind_descriptor_sets(
+                                        frame.command_buffer,
+                                        vk::PipelineBindPoint::GRAPHICS,
+                                        resources.layout,
+                                        1,
+                                        &[material_set],
+                                        &[],
+                                    );
+                                    bound_material_set = material_set;
+                                }
                                 let push = PushConstants {
                                     model: draw.data.model.to_cols_array(),
                                     tint: draw.data.tint,
@@ -2467,6 +2791,8 @@ impl Drop for VulkanCore {
             }
             self.destroy_depth_resources();
             self.destroy_all_meshes();
+            // 存活材质的缓冲在 device 销毁前释放（描述符集随上面的池销毁，R-11）。
+            self.destroy_all_materials();
             self.device.destroy_command_pool(self.transfer_pool, None);
             for view in self.image_views.drain(..) {
                 self.device.destroy_image_view(view, None);
@@ -2661,8 +2987,16 @@ mod tests {
     }
 
     #[test]
-    fn camera_ubo_size_is_64_bytes() {
-        assert_eq!(CAMERA_UBO_SIZE, 64);
+    fn camera_ubo_size_is_80_bytes() {
+        // std140：mat4 view_proj（0…63）+ vec3 camera_position（64…75）+ 补齐（76…79）。
+        assert_eq!(CAMERA_UBO_SIZE, 80);
+    }
+
+    #[test]
+    fn material_ubo_size_matches_data_layout() {
+        // 材质 UBO 大小必须精确等于 std140 对齐后的 MaterialData（R-11）。
+        assert_eq!(MATERIAL_UBO_SIZE, 48);
+        assert_eq!(MATERIAL_UBO_SIZE as usize, MaterialData::SIZE);
     }
 
     #[test]

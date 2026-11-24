@@ -1,0 +1,18 @@
+digraph RenderGraph {
+    rankdir=LR;
+
+    r0 [label="swapchain\nimported image (UNDEFINED → PRESENT)", shape=ellipse];
+    r1 [label="depth\nimported image (DEPTH_ATTACHMENT, 静态)", shape=ellipse];
+    r2 [label="mesh[0g0]\nimported buffer", shape=ellipse];
+    r3 [label="mesh[2g0]\nimported buffer", shape=ellipse];
+    r4 [label="mesh[1g0]\nimported buffer", shape=ellipse];
+
+    p0 [label="main_geometry\ngraphics", shape=box];
+
+    p0 -> r0 [label="write(color)"];
+    p0 -> r1 [label="write(depth)"];
+
+    p0 -> r0 [style=dashed, constraint=false, label="barrier UNDEFINED → COLOR_ATTACHMENT\nTOP_OF_PIPE | COLOR_ATTACHMENT_OUTPUT"];
+    frame_end [label="frame_end", shape=box, style=rounded];
+    r0 -> frame_end [style=dashed, constraint=false, label="barrier COLOR_ATTACHMENT → PRESENT\nCOLOR_ATTACHMENT_OUTPUT | BOTTOM_OF_PIPE"];
+}

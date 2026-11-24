@@ -1,7 +1,7 @@
 # M2 剩余任务清单（多帧在飞行 → RenderGraph → 显存/管线基础设施 → 材质与 PBR）
 
-- 日期：2026-11-24（批次 A–D 于同日完成；批次 E 同日完成）
-- 状态：**批次 A–E 已完成**（R-01…R-10 落地；仅余批次 F：R-11…R-15 材质/PBR/剔除）
+- 日期：2026-11-24（批次 A–D 于同日完成；批次 E 同日完成；批次 F 同日完成）
+- 状态：**全部完成（批次 A–F，R-01…R-15 落地）——M2 剩余达成，进入 M3**
 - 关联：README §8.2（M2）、§8.3（v0.3 垂直切片）、§9.6、§14.4；ADR-0004（渲染管线与 RenderGraph）、
   ADR-0011（Slang，第 8 条多入口延后）、ADR-0012（帧数据/提交边界，第 5 条临时取舍）；`docs/plans/v0.2-cube.md`
 - 估算：**约 12.5 净人日**（批次 A 1.5 + B 3.5 + C 0.5 + D 1.0 + E 3.0 + F 5.0，含 0.5 冗余）
@@ -306,6 +306,16 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 | 校验层 | `cargo run -- --validation --frames 120` | ✅ 0 validation 消息，57.9 FPS；深度图像/网格/staging/UBO 全部经分配器（Gate 5） | 2026-11-24 |
 | 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 57.9 FPS，0 validation 消息（与批次 D 基线 58.7 持平，vsync 波动内） | 2026-11-24 |
 | headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常（headless 走同步释放路径） | 2026-11-24 |
+| （批次 E 记录见 §10；以下为批次 F） | | | |
+| 单测 | `cargo test --workspace` | ✅ 全部套件 ok（`mir-render` 50 项：材质布局/守恒、sphere/torus 几何与绕序；`mir-math` 16 项：Frustum 六平面/点与包围盒测试），0 失败 | 2026-11-24 |
+| 格式/静态检查 | `cargo fmt --all -- --check`；`cargo clippy --workspace --all-targets -- -D warnings` | ✅ 通过（仅 Cargo 清单既有 unused dependency 警告） | 2026-11-24 |
+| 校验层 | `cargo run -- --validation --frames 120 --stats` | ✅ 0 validation 消息，58.1 FPS；PBR 管线 + set 1 材质 UBO + 80 B 相机 UBO 全链路合法 | 2026-11-24 |
+| `.spv` 校验 | `spirv-val shaders/pbr/pbr.spv` + 本地 `slangc -fvk-use-entrypoint-name` 重编译 | ✅ 通过；`vertexMain`/`fragmentMain` 入口保留；CI 双 job 已同步 pbr.slang（Gate 6 着色器部分） | 2026-11-24 |
+| PBR 视觉 | metallic/roughness 梯度 3×3 阵列 + 抛光金属圆环 + 自发光球（程序化几何） | ✅ 梯度差异肉眼可辨；材质 UBO 经 headless 单测写读守恒（像素级断言不在 Gate 范围） | 2026-11-24 |
+| 剔除观测 | 相机背对场景（临时 `yaw += π` 实验，验收后已还原） | ✅ `--stats` 输出提交实例 11 → 0，`main_geometry` GPU 耗时 0.040 → 0.016 ms（Gate 6） | 2026-11-24 |
+| dump 回归 | `cargo run -- --validation --frames 120 --graph-dump --stats` | ✅ `render_graph.dot` 正常写盘；剔除不影响帧图结构 | 2026-11-24 |
+| 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080 --stats` | ✅ 600 帧完成，平均 58.6 FPS，0 validation 消息，提交 11 实例，`main_geometry` 0.067 ms（Gate 6） | 2026-11-24 |
+| headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常 | 2026-11-24 |
 
 ## 10. 执行记录
 
@@ -407,3 +417,24 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 - 实现备注：vulkanalia 0.35 的 `Device` 为 `Clone`（分配器持有独立句柄）；`unmap_memory` 按整个 `vk::DeviceMemory` 生效——因此持久映射的相机 UBO 必须 dedicated，避免 staging map/unmap 影响。
 
 下一步：批次 F（R-11 材质描述符 → R-12 PBR 着色器/程序化几何 → R-13 Frustum/剔除 → R-14 验收 → R-15 文档）为 M2 剩余最后一批，完成后进入 M3（hecs/Actor/层级）。
+
+### 2026-11-24：批次 F——材质、基础 PBR 与视锥剔除（R-11…R-15 已完成，M2 剩余全部达成）
+
+| 项 | 改动 |
+|---|---|
+| 材质系统（R-11） | 新增 `crates/mir-render/src/material.rs`：`MaterialData`（repr(C) 48 B，std140 对齐：base_color@0/metallic@16/roughness@20/emissive@32）+ `MaterialHandle` 世代句柄（对齐 `MeshHandle`）；`VulkanCore` 材质槽位表 + `create_material`/`destroy_material`——参数 UBO 走 `create_buffer`（UNIFORM_BUFFER，HOST_VISIBLE\|COHERENT，**dedicated 整块**：map/unmap 按整个 DeviceMemory 生效，不能与 staging 共块），管线就绪时从描述符池分配 set 1（binding 0，FRAGMENT 阶段）并按「命名数组」模式写入；描述符池扩容（`max_sets`/UBO 数 = 帧 2 + 材质上限 64，带 `FREE_DESCRIPTOR_SET_BIT`）；`DrawInstance` 增 `material: Option<MaterialHandle>`，`RenderContext::submit_with_material` + `submit`（默认材质）+ `create_material`/`destroy_material`；默认材质（白色 Lambert）随 `init_pipeline` 创建，句柄无效时绘制兜底；销毁经 `DeletionEntry.descriptor_sets` 在 fence 信号后归还描述符池（循环压力不泄漏） |
+| PBR 管线（R-12） | `shaders/pbr/pbr.slang`：解析式 metallic-roughness（GGX/Trowbridge-Reitz D + Schlick-GGX 可见性 + Schlick 菲涅尔，f0 = 0.04↔base_color 按金属度插值）+ 单方向光（着色器常量）+ 固定半球环境项；主管线 `SHADER_CODE` 切换到 `pbr.spv`；`Vertex` 增 `normal`（stride 24→36，`Vertex::SIZE` 单一源头同步管线 attribute 2 offset 24）；相机 UBO 64→80 B（`CameraFrame.camera_position` 供视线向量，set 0 stage 扩为 VERTEX\|FRAGMENT——首启曾报 VUID-07988 已修）；`geometry.rs` cube 面法线 + 新增 `sphere()`/`torus()`（含解析法线，绕序单测逐三角形断言）；CI 双 job 增 pbr.slang 编译与 diff |
+| 视锥剔除（R-13） | `mir-math/src/frustum.rs`：`Frustum::from_view_proj`（Gribb–Hartmann 六平面提取，Vulkan 深度 0…1：近 = clip z 行、远 = w − z，平面归一化）+ `Aabb` + `contains_point`/`intersects_aabb`（p-vertex 测试）；应用层 `on_render` 对每实体 `scale × 单位半包围` 生成 `Aabb`（忽略旋转，圆环用轴对齐保守包围），剔除后再 `submit`（ADR-0004 决策 6：渲染层不感知剔除）；`--stats` 快照输出剔除后提交实例数 |
+| 演示场景（R-12） | 3×3 阵列（去掉中心）改 metallic 列向 0→1 / roughness 行向 0.15→1 的 8 种材质白立方体；中心为自转抛光金属圆环（gold，roughness 0.25）；两枚球（粗糙塑料 + 自发光）验证对照；`Prop` 枚举区分 cube/sphere/torus，网格与材质均惰性创建、失败降级不 panic |
+| 单测 | `material.rs` 3 项（std140 布局/默认白 Lambert/世代句柄）+ `vulkan.rs` 材质 UBO 48 B 静态断言 + lib.rs headless 多材质提交/守恒测试（`materials_submit_and_destroy_without_panic_when_gpu_available`）+ geometry sphere/torus 有效性/法线/绕序测试 + `mir-math` Frustum/Aabb 4 项 |
+
+验证（2026-11-24）：
+
+- `cargo test --workspace` 全绿（`mir-render` 50 项、`mir-math` 16 项）；fmt / `clippy -D warnings` 通过（仅既有 unused dependency 清单警告）。
+- `cargo run -- --validation --frames 120 --stats`：0 validation 消息，58.1 FPS（首启曾报 VUID-07988——片元阶段读相机 UBO 而 stageFlags 只声明 VERTEX，扩为 VERTEX\|FRAGMENT 后清零）。
+- `cargo run --release -- --validation --frames 600 --width 1920 --height 1080 --stats`：600 帧 58.6 FPS，0 消息，`main_geometry` 0.067 ms（Gate 6）。
+- 剔除观测：临时把相机 yaw + π 背对场景 → `--stats` 提交实例 11→0，`main_geometry` 0.041→0.016 ms；实验后已还原（Gate 6）。
+- `--graph-dump`、`--headless --frames 1000` 回归正常；`render_graph.dot` 写盘正常。
+- 实现备注：vulkanalia `free_descriptor_sets` 需要池带 `FREE_DESCRIPTOR_SET_BIT`；材质槽位世代号沿用网格的 `(generation << 32) | index` 编码；默认材质占用独立槽位不参与复用。
+
+下一步：M2 全部达成（Gate 1–7 通过）。进入 M3（hecs/Actor/层级）；`Transform` 收敛到 `mir-math` 并按 ADR-0012 校准演示单位（米 → 厘米）。

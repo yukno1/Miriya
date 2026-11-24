@@ -3,20 +3,31 @@
 use miriya_engine::core::{AppState, EngineConfig, EngineContext};
 use miriya_engine::ecs::{Entity, World};
 use miriya_engine::input::{KeyCode, MouseButton};
-use miriya_engine::math::{Quat, Vec2, Vec3};
-use miriya_engine::render::{CameraFrame, InstanceData, MeshHandle};
+use miriya_engine::math::{Aabb, Frustum, Quat, Vec2, Vec3};
+use miriya_engine::render::{CameraFrame, InstanceData, MaterialData, MaterialHandle, MeshHandle};
 use miriya_engine::scene::{Camera, CameraController, CameraInput, Transform};
+
+/// 演示物体使用的程序化几何（R-12）。
+#[derive(Debug, Clone, Copy)]
+enum Prop {
+    Cube,
+    Sphere,
+    Torus,
+}
 
 /// 游戏状态：实现引擎的 `AppState` trait。
 struct Game {
     world: World,
-    /// 演示立方体（3×3 阵列 + 中心自转），实体持有变换，tint 随实例提交。
-    cubes: Vec<(Entity, [f32; 4])>,
-    /// 阵列中心的实体，用于逐帧更新自转。
+    /// 演示物体：实体 + 几何类型 + 材质下标（`self.materials` 的下标）。
+    props: Vec<(Entity, Prop, usize)>,
+    /// 阵列中心的实体（自转圆环），用于逐帧更新。
     center: Entity,
-    /// 立方体网格句柄（渲染初始化后才能创建，故惰性创建）。
-    cube_mesh: Option<MeshHandle>,
+    /// 网格句柄（渲染初始化后才能创建，故惰性创建）。
+    meshes: Option<(MeshHandle, MeshHandle, MeshHandle)>,
     mesh_failed: bool,
+    /// 材质句柄（R-12：metallic/roughness 梯度 + 金圆环 + 自发光球），惰性创建。
+    materials: Vec<MaterialHandle>,
+    materials_failed: bool,
     /// 自由飞行相机与控制器（输入无关，便于 headless 验证）。
     camera: Camera,
     camera_controller: CameraController,
@@ -29,16 +40,22 @@ struct Game {
     pass_time_total: Vec<(String, f64)>,
     /// 参与 GPU 耗时统计的帧数。
     pass_time_frames: u32,
+    /// 上一帧剔除后实际提交的实例数（R-13 剔除生效的可观测诊断）。
+    last_submitted: usize,
 }
 
 impl Game {
     fn new(stats_enabled: bool, graph_dump: bool) -> Self {
         let mut world = World::new();
-        let mut cubes = Vec::with_capacity(10);
+        let mut props: Vec<(Entity, Prop, usize)> = Vec::new();
 
-        // 3×3 阵列：1 单位 = 1 米，边长 2、间距 3（ADR-0012 记录单位偏差）。
+        // 3×3 阵列（去掉中心位置留给自转圆环）：列向金属度梯度、行向粗糙度梯度，
+        // 肉眼可辨 metallic 0↔1 与 roughness 0↔1 的 PBR 差异（R-12 Gate）。
         for (row, x) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
             for (column, y) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
+                if row == 1 && column == 1 {
+                    continue; // 中心留给圆环
+                }
                 let entity = world.spawn();
                 world.insert(
                     entity,
@@ -48,25 +65,44 @@ impl Game {
                         ..Default::default()
                     },
                 );
-                let tint = [
-                    0.55 + 0.15 * row as f32,
-                    0.55 + 0.15 * column as f32,
-                    0.9,
-                    1.0,
-                ];
-                cubes.push((entity, tint));
+                props.push((entity, Prop::Cube, props.len()));
             }
         }
 
+        // 阵列中心：自转金属圆环。
         let center = world.spawn();
         world.insert(
             center,
             Transform {
-                scale: Vec3::splat(2.0),
+                scale: Vec3::splat(1.0),
                 ..Default::default()
             },
         );
-        cubes.push((center, [1.0, 1.0, 1.0, 1.0]));
+        let torus_material = props.len();
+        props.push((center, Prop::Torus, torus_material));
+
+        // 两枚球：粗糙红塑料（左后）与自发光（右前），验证 emissive 与漫反射对照。
+        let plastic_sphere = world.spawn();
+        world.insert(
+            plastic_sphere,
+            Transform {
+                position: Vec3::new(-8.0, 0.0, 0.0),
+                scale: Vec3::splat(1.5),
+                ..Default::default()
+            },
+        );
+        props.push((plastic_sphere, Prop::Sphere, props.len()));
+
+        let emissive_sphere = world.spawn();
+        world.insert(
+            emissive_sphere,
+            Transform {
+                position: Vec3::new(0.0, 8.0, 0.0),
+                scale: Vec3::splat(1.2),
+                ..Default::default()
+            },
+        );
+        props.push((emissive_sphere, Prop::Sphere, props.len()));
 
         let mut camera = Camera {
             position: Vec3::new(-12.0, -10.0, 8.0),
@@ -76,10 +112,12 @@ impl Game {
 
         Self {
             world,
-            cubes,
+            props,
             center,
-            cube_mesh: None,
+            meshes: None,
             mesh_failed: false,
+            materials: Vec::new(),
+            materials_failed: false,
             camera,
             camera_controller: CameraController::default(),
             looking: false,
@@ -87,6 +125,58 @@ impl Game {
             graph_dump,
             pass_time_total: Vec::new(),
             pass_time_frames: 0,
+            last_submitted: 0,
+        }
+    }
+
+    /// 惰性创建全部材质（顺序与 `props` 的材质下标对应）。
+    fn ensure_materials(&mut self, ctx: &mut EngineContext) {
+        if !self.materials.is_empty() || self.materials_failed {
+            return;
+        }
+        let mut list = Vec::with_capacity(11);
+        // 阵列立方体：metallic 列向 0→1、roughness 行向 0.15→1（8 个，中心留给圆环）。
+        for (row, x) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
+            for (column, y) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
+                if row == 1 && column == 1 {
+                    continue; // 中心留给圆环，跳过（与 props 生成顺序一致）
+                }
+                let _ = (x, y);
+                list.push(MaterialData::new(
+                    [0.85, 0.85, 0.9, 1.0],
+                    column as f32 * 0.5,
+                    0.15 + 0.425 * row as f32,
+                    [0.0; 3],
+                ));
+            }
+        }
+        // 自转圆环：抛光金属。
+        list.push(MaterialData::new(
+            [1.0, 0.77, 0.34, 1.0],
+            1.0,
+            0.25,
+            [0.0; 3],
+        ));
+        // 粗糙塑料球。
+        list.push(MaterialData::new([0.8, 0.2, 0.2, 1.0], 0.0, 0.9, [0.0; 3]));
+        // 自发光球。
+        list.push(MaterialData::new(
+            [0.05, 0.05, 0.05, 1.0],
+            0.0,
+            0.5,
+            [0.1, 0.45, 0.4],
+        ));
+
+        for data in &list {
+            match ctx.renderer.create_material(data) {
+                Ok(handle) => self.materials.push(handle),
+                Err(error) => {
+                    eprintln!("材质创建失败：{error}");
+                    self.materials_failed = true;
+                    self.materials.clear();
+                    return;
+                }
+            }
         }
     }
 }
@@ -150,37 +240,76 @@ impl AppState for Game {
     }
 
     fn on_render(&mut self, ctx: &mut EngineContext) {
-        if self.cube_mesh.is_none() && !self.mesh_failed {
-            match ctx.renderer.create_mesh(&miriya_engine::render::cube()) {
-                Ok(handle) => self.cube_mesh = Some(handle),
-                Err(error) => {
-                    eprintln!("立方体网格上传失败：{error}");
+        if self.meshes.is_none() && !self.mesh_failed {
+            let cube = ctx.renderer.create_mesh(&miriya_engine::render::cube());
+            let sphere = ctx
+                .renderer
+                .create_mesh(&miriya_engine::render::sphere(1.0, 32, 16));
+            let torus = ctx
+                .renderer
+                .create_mesh(&miriya_engine::render::torus(1.6, 0.55, 48, 24));
+            match (cube, sphere, torus) {
+                (Ok(cube), Ok(sphere), Ok(torus)) => {
+                    self.meshes = Some((cube, sphere, torus));
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    eprintln!("网格上传失败：{error}");
                     self.mesh_failed = true;
                 }
             }
         }
+        self.ensure_materials(ctx);
 
-        ctx.renderer.begin_frame([0.1, 0.1, 0.15, 1.0]);
+        ctx.renderer.begin_frame([0.02, 0.02, 0.04, 1.0]);
 
         let (width, height) = ctx.renderer.size();
         let aspect = width.max(1) as f32 / height.max(1) as f32;
         ctx.renderer.set_camera(CameraFrame {
             view_proj: self.camera.view_projection(aspect),
+            camera_position: self.camera.position.to_array(),
         });
 
-        if let Some(mesh) = self.cube_mesh {
-            for (entity, tint) in self.cubes.iter().copied() {
+        if let Some((cube_mesh, sphere_mesh, torus_mesh)) = self.meshes {
+            // 视锥剔除（R-13，ADR-0004 决策 6）：extract 侧做包围盒测试后提交，
+            // 渲染层不感知剔除。包围盒忽略旋转（自转圆环用轴对齐保守包围）。
+            let frustum = Frustum::from_view_proj(self.camera.view_projection(aspect));
+            let mut submitted = 0_usize;
+            for (entity, prop, material_index) in self.props.iter().copied() {
                 let Some(transform) = self.world.get::<Transform>(entity) else {
                     continue;
                 };
-                ctx.renderer.submit(
-                    mesh,
-                    InstanceData {
-                        model: transform.to_matrix(),
-                        tint,
-                    },
+                let unit_half = match prop {
+                    Prop::Cube => Vec3::splat(0.5),
+                    Prop::Sphere => Vec3::splat(1.0),
+                    // 圆环主半径 1.6 + 管半径 0.55（XY），Z 向厚 0.55。
+                    Prop::Torus => Vec3::new(2.15, 2.15, 0.55),
+                };
+                let half_extent = Vec3::new(
+                    transform.scale.x * unit_half.x,
+                    transform.scale.y * unit_half.y,
+                    transform.scale.z * unit_half.z,
                 );
+                let aabb = Aabb::from_center_half_extent(transform.position, half_extent);
+                if !frustum.intersects_aabb(&aabb) {
+                    continue;
+                }
+                let mesh = match prop {
+                    Prop::Cube => cube_mesh,
+                    Prop::Sphere => sphere_mesh,
+                    Prop::Torus => torus_mesh,
+                };
+                let instance = InstanceData {
+                    model: transform.to_matrix(),
+                    tint: [1.0, 1.0, 1.0, 1.0],
+                };
+                if let Some(&material) = self.materials.get(material_index) {
+                    ctx.renderer.submit_with_material(mesh, material, instance);
+                } else {
+                    ctx.renderer.submit(mesh, instance);
+                }
+                submitted += 1;
             }
+            self.last_submitted = submitted;
         }
 
         ctx.renderer.end_frame();
@@ -215,8 +344,8 @@ impl AppState for Game {
                     format!("GPU pass：{}", parts.join("，"))
                 };
                 println!(
-                    "[stats] 帧 {}，FPS {:.1}，{}",
-                    ctx.stats.frames, ctx.stats.fps, snapshot
+                    "[stats] 帧 {}，FPS {:.1}，提交实例 {}，{}",
+                    ctx.stats.frames, ctx.stats.fps, self.last_submitted, snapshot
                 );
             }
         }

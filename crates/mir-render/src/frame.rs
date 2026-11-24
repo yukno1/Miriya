@@ -4,20 +4,24 @@
 
 use mir_math::Mat4;
 
-use crate::MeshHandle;
+use crate::{MaterialHandle, MeshHandle};
 
 /// 相机帧数据。
 ///
-/// v0.2 只传 view-projection；M5 的 PBR 光照需要相机世界位置，届时在此扩展。
+/// R-12 起 PBR 高光需要相机世界位置（视线方向 `V = normalize(camera_position - world_pos)`）；
+/// UBO 布局为 std140：`view_proj`（64 B）+ `camera_position`（偏移 64，补齐到 80 B）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraFrame {
     pub view_proj: Mat4,
+    /// 相机世界坐标（米/单位与场景一致）。
+    pub camera_position: [f32; 3],
 }
 
 impl Default for CameraFrame {
     fn default() -> Self {
         Self {
             view_proj: Mat4::IDENTITY,
+            camera_position: [0.0; 3],
         }
     }
 }
@@ -38,10 +42,13 @@ impl Default for InstanceData {
     }
 }
 
-/// 一帧内的一次绘制请求（网格 + 实例数据）。
+/// 一帧内的一次绘制请求（网格 + 实例数据 + 可选材质）。
+///
+/// `material = None` 表示使用渲染层内置的默认材质（白色 Lambert）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DrawInstance {
     pub mesh: MeshHandle,
+    pub material: Option<MaterialHandle>,
     pub data: InstanceData,
 }
 
