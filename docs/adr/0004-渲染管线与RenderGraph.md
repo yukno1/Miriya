@@ -22,6 +22,8 @@
    `spirv-reflect` 生成绑定；`spirv-val` + validation layer 把关；离线缓存以管线哈希为键，开发模式热重载。
 6. **帧结构**：2–3 帧在飞行、环形暂存缓冲；交换链重建/设备丢失有恢复路径；调试版启用 Khronos validation layer，
    发布版持久化 pipeline cache。
+   > 追记（2026-11-24）：帧在飞行取 2 并已落地；管线缓存（`VkPipelineCache` 常驻 + 磁盘持久化，
+   键 = 设备 UUID + 驱动版本 + 管线状态哈希）随 M2 批次 D 完成。
 7. **前提已验证**：M0 PoC（RFC 0001）确认实例/设备/surface/交换链前置查询链路可用。
 
 ## 替代方案

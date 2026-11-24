@@ -27,13 +27,9 @@ jobs:
       - name: Compile shaders with Slang
         shell: pwsh
         run: |
-          slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
+          slangc shaders/hello/triangle.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/hello/triangle.spv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
+          slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
 
@@ -84,10 +80,8 @@ jobs:
       - name: Compile shaders with Slang
         shell: bash
         run: |
-          slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
-          slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
-          slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
-          slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
+          slangc shaders/hello/triangle.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/hello/triangle.spv
+          slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
           git diff --exit-code -- shaders/hello/*.spv shaders/cube/*.spv
 
       - name: Install Rust toolchain

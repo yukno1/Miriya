@@ -1,7 +1,7 @@
 # M2 剩余任务清单（多帧在飞行 → RenderGraph → 显存/管线基础设施 → 材质与 PBR）
 
-- 日期：2026-11-24（批次 A、B 于同日完成）
-- 状态：**批次 A、B 已完成**（R-01…R-05 落地；批次 C 起未开工）
+- 日期：2026-11-24（批次 A–D 于同日完成）
+- 状态：**批次 A–D 已完成**（R-01…R-07 落地；批次 E 起未开工）
 - 关联：README §8.2（M2）、§8.3（v0.3 垂直切片）、§9.6、§14.4；ADR-0004（渲染管线与 RenderGraph）、
   ADR-0011（Slang，第 8 条多入口延后）、ADR-0012（帧数据/提交边界，第 5 条临时取舍）；`docs/plans/v0.2-cube.md`
 - 估算：**约 12.5 净人日**（批次 A 1.5 + B 3.5 + C 0.5 + D 1.0 + E 3.0 + F 5.0，含 0.5 冗余）
@@ -290,6 +290,14 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 | 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 58.2 FPS，0 validation 消息（与批次 A 基线 57.7 持平） | 2026-11-24 |
 | headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常 | 2026-11-24 |
 | 交换链重建路径 | 单测 `minimized_window_skips_frame`（真实 GPU：resize(0,0) → resize(800,600) 触发重建） | ✅ 通过；拖拽 resize 手测留待批次 C 一并回归（graph 每帧重建，重建路径与批次 A 同构） | 2026-11-24 |
+| （批次 C/D 记录见 §10；以下为批次 C/D） | | | |
+| 单测 | `cargo test --workspace` | ✅ 全部套件 ok，0 失败 | 2026-11-24 |
+| 格式/静态检查 | `cargo fmt --all -- --check`；`cargo clippy --workspace --all-targets -- -D warnings` | ✅ 通过（仅 Cargo 清单既有 unused dependency 警告） | 2026-11-24 |
+| 校验层 | `cargo run -- --validation --frames 120` | ✅ 0 validation 消息；画面与批次 B 一致 | 2026-11-24 |
+| `.spv` 校验 | `spirv-val shaders/cube/cube.spv shaders/hello/triangle.spv` + 入口名字符串检查 | ✅ 通过；`vertexMain`/`fragmentMain` 入口名保留；`.spv` 总数 8→4（Gate 3） | 2026-11-24 |
+| 管线缓存 | 重定向 `LOCALAPPDATA` 到工作区两次启动对比；损坏文件（3 字节）启动 | ✅ 首启「未命中→已写回 5404 字节」；二启「命中 5388 字节」（Gate 4）；损坏仅 warn 并重建 | 2026-11-24 |
+| 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 58.7 FPS，0 validation 消息 | 2026-11-24 |
+| headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常；headless 无缓存读写日志 | 2026-11-24 |
 
 ## 10. 执行记录
 
@@ -338,3 +346,34 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 - 实现备注：vulkanalia 0.35 的 `get_query_pool_results` 以字节切片 + stride 暴露，回读按 8 字节对齐转 u64；`PipelineStageFlags2` 中旧 `TRANSFER` 位命名为 `ALL_TRANSFER`。
 
 下一步：批次 C（R-06 单 `.spv` 多入口）与批次 D（R-07 管线缓存持久化）均只依赖 R-04，可并行推进；关键路径继续走批次 E（R-08 子分配器）。
+
+### 2026-11-24：批次 C——单 `.spv` 多入口（R-06 已完成）
+
+| 项 | 改动 |
+|---|---|
+| 着色器产物 | `slangc -profile glsl_450 -target spirv -fvk-use-entrypoint-name` 单文件编译：`shaders/cube/cube.spv`、`shaders/hello/triangle.spv`；删除 4 个按阶段 `.spv`；`spirv-val` 通过，SPIR-V 内 `vertexMain`/`fragmentMain` 入口名保留 |
+| Rust 侧 | `init_pipeline` 改为单 ShaderModule（`SHADER_CODE` 指向 `cube.spv`），两个 stage 分别 `.name(b"vertexMain\0")` / `.name(b"fragmentMain\0")`；`PipelineResources`/`PipelineGuard` 收敛为单一 `shader_module` 字段（defuse 返回值 6→5 项） |
+| CI | 两个 job 的 slangc 命令 4 条减为 2 条（加 `-fvk-use-entrypoint-name`），`git diff --exit-code` 目标不变（通配符自动匹配新文件名） |
+| 文档 | ADR-0011 第 3/8 条改为「多入口已落地」；README §13 开发命令与 §14.2 已知问题同步 |
+
+验证（2026-11-24）：`cargo run -- --validation --frames 120` 0 消息，画面不变；release 1080p 600 帧 58.7 FPS（Gate 3 达成）。
+
+### 2026-11-24：批次 D——管线缓存持久化（R-07 已完成）
+
+| 项 | 改动 |
+|---|---|
+| 缓存对象 | `VulkanCore` 新增 `pipeline_cache: Option<vk::PipelineCache>`；`init_pipeline` 经 `ensure_pipeline_cache` 创建/复用，`create_graphics_pipelines` 改用该缓存（创建失败降级为 null 缓存，对驱动合法） |
+| 缓存键 | 键 = FNV-1a(设备 `pipeline_cache_uuid` + `driver_version` + 管线状态哈希)；状态哈希 = FNV-1a(着色器字节码 + `PIPELINE_STATE_TAG` 常量)；文件级命中判定（magic `MRPC` + 版本 + 键头），不做管线级 diff |
+| 磁盘路径 | Windows `%LOCALAPPDATA%/Miriya/cache/pipeline/<uuid>_<driver>_<key>.bin`；Linux 占位 `XDG_CACHE_HOME`（缺省 `$HOME/.cache`）同构路径；环境变量缺失降级为纯内存缓存 |
+| 容错 | 文件缺失为正常首启（info）；损坏/键不匹配/IO 异常仅 `warn` 并空缓存重建；写回（`get_pipeline_cache_data` → 头 + 数据）失败仅 `warn`，绝不 panic/阻塞；headless 不调 `init_pipeline`，自然不读写 |
+| 生命周期 | `Drop` 在 `device_wait_idle` 与管线销毁之后 `destroy_pipeline_cache`；`init_pipeline` 失败路径由既有 `Drop` 回收覆盖 |
+| 实现备注 | vulkanalia 0.35 的 `get_pipeline_cache_data` 直接返回 `VkResult<Vec<u8>>`（collector 模式不存在）；`pipeline_cache_uuid` 为 `ByteArray<16>`，需 `as_slice()` |
+
+验证（2026-11-24，重定向 `LOCALAPPDATA` 到工作区绕开本机沙箱对 exe 写 AppData 的限制）：
+
+- 首次启动：`管线缓存未命中（首次启动）` → `管线缓存已写回: 5404 字节`。
+- 二次启动：`管线缓存命中: 5388 字节`（Gate 4 达成；5388 = 5404 − 16 字节头）。
+- 损坏文件（3 字节）：`warn 管线缓存文件损坏或键不匹配，忽略重建` → 空缓存重建 → 正常写回。
+- 本机沙箱直接写 `%LOCALAPPDATA%` 报 `os error 5` 时仅告警降级，渲染完全不受影响（容错路径实机验证）。
+
+下一步：批次 E（R-08 子分配器，关键路径）→ R-09 接管分配点 → R-10 压力验证 → 批次 F（材质/PBR/剔除）。

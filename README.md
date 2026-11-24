@@ -468,7 +468,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`，含测试 | 🟡 原型 | `Transform` 收敛到本 crate、补 `Aabb`/`Frustum`/坐标系转换（M0） |
 | `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
-| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants/10 实例绘制、校验层与日志桥接 | 🟡 原型 | RenderGraph、材质/PBR、多帧在飞行、显存子分配器（M2 剩余/M5） |
+| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants/10 实例绘制、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化 | 🟡 原型 | 显存子分配器、材质/PBR（M2 批次 E/F/M5） |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
 | `mir-scene` | `Scene`、`Transform`（含旋转/TRS）、UI 无关的自由相机与控制器 | 🟡 原型 | Level/Actor/层级/组件（M3） |
@@ -654,8 +654,8 @@ Miriya/
   不引入 ash）；交换链重建/设备丢失有恢复路径。
 - **管线**：Clustered Forward+：CSM 阴影 → 深度预通道 → 不透明（PBR + IBL）→ 透明 → SSAO/Bloom/色调映射 → UI。
 - **RenderGraph**：pass 声明读写、自动 barrier/layout 转换、临时纹理别名、GPU 时间戳；每帧可 dump 依赖图。
-- **着色器**：Slang（公共 module + `import`）经 `slangc` 直接编译为 SPIR-V；当前按阶段输出两个 `.spv`，
-  阶段入口统一为 `main`，单 `.spv` 多入口随 M2 RenderGraph 重构一起处理；`spirv-reflect` 生成绑定；
+- **着色器**：Slang（公共 module + `import`）经 `slangc -fvk-use-entrypoint-name` 编译为单个 SPIR-V，
+  保留 `vertexMain`/`fragmentMain` 入口名，Rust 侧单 ShaderModule 按入口名绑定；`spirv-reflect` 生成绑定；
   `spirv-val` 与校验层把关；离线缓存以管线哈希为键；开发模式热重载；材质参数走 UBO/SSBO。
 - **平台**：Vulkan 为 Windows/Linux 通用 API；启用 Linux 时只需替换 surface/平台后端，渲染代码不变。
 - **运行前提**：Windows 10/11 x64 + 支持 Vulkan 1.3 的显卡驱动；启动时检测 API/特性并给出可读错误，
@@ -1051,8 +1051,8 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
 2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
    无世代标记，后续若回收 ID 会产生悬垂句柄。
-3. `mir-render` 已具备深度、网格、逐实例绘制与校验层，但尚无材质/PBR、RenderGraph、多帧在飞行、
-   自研显存子分配器与视锥剔除；继续按阶段输出两个 `.spv`，单 `.spv` 多入口随 RenderGraph 重构处理（M2 剩余/M5）。
+3. `mir-render` 已具备深度、网格、逐实例绘制、校验层、多帧在飞行、RenderGraph v0.5、单 `.spv` 多入口与
+   持久化管线缓存，但尚无材质/PBR、自研显存子分配器与视锥剔除（M2 批次 E/F）。
 4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
 5. Git 仓库已初始化且已推送到 `origin/main`；本地工作区需随每次里程碑同步提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
@@ -1086,12 +1086,11 @@ cargo run -- --validation --frames 120
 cargo run -p mir-vulkan-probe
 
 # 修改 *.slang 后，重新编译 SPIR-V（需 Slang 编译器，可由 Vulkan SDK 或 Slang release 提供）
-slangc shaders/hello/triangle.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/hello/triangle.vert.spv
-slangc shaders/hello/triangle.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/hello/triangle.frag.spv
-slangc shaders/cube/cube.slang -entry vertexMain -stage vertex -profile glsl_450 -target spirv -o shaders/cube/cube.vert.spv
-slangc shaders/cube/cube.slang -entry fragmentMain -stage fragment -profile glsl_450 -target spirv -o shaders/cube/cube.frag.spv
-spirv-val shaders/hello/triangle.vert.spv shaders/hello/triangle.frag.spv
-spirv-val shaders/cube/cube.vert.spv shaders/cube/cube.frag.spv
+# 单 .spv 多入口：-fvk-use-entrypoint-name 保留 vertexMain/fragmentMain 入口名
+slangc shaders/hello/triangle.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/hello/triangle.spv
+slangc shaders/cube/cube.slang -profile glsl_450 -target spirv -fvk-use-entrypoint-name -o shaders/cube/cube.spv
+spirv-val shaders/hello/triangle.spv
+spirv-val shaders/cube/cube.spv
 ```
 
 `cargo check --workspace`、`cargo test --workspace`、`cargo fmt --all -- --check` 与
@@ -1108,9 +1107,9 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 - [x] M2 / v0.2 Cube：深度、交换链健壮性、网格上传、cube 着色器与管线、10 实例提交、自由相机、
       代码内校验层 + `mir-log` 桥接、release 悬垂指针修复、CI 双 shader 校验；详见
       `docs/plans/v0.2-cube.md` §9/§10。
-- [ ] **M2 剩余**：RenderGraph v0.5、2–3 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存、
-      自研显存子分配器、网格/材质系统与基础 PBR（v0.3 前置）；任务清单与验收 Gate 见
-      `docs/plans/m2-remaining.md`。
+- [ ] **M2 剩余**：RenderGraph v0.5、2–3 帧在飞行与环形 UBO、单 `.spv` 多入口、持久化管线缓存
+      ✅ 已完成（批次 A–D，2026-11-24）；尚余自研显存子分配器（批次 E）、网格/材质系统与基础 PBR
+      （批次 F，v0.3 前置）；任务清单与验收 Gate 见 `docs/plans/m2-remaining.md`。
 - [ ] **M3**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene` 收敛到 `mir-math`
       并按 ADR-0012 校准演示单位（米 → 厘米）。
 - [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。

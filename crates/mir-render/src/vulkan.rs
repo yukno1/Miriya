@@ -29,6 +29,50 @@ const TIMESTAMP_QUERY_COUNT: u32 = 64;
 /// `--graph-dump` 开启时每帧覆盖写入的依赖图 DOT 文件（工作目录下）。
 const GRAPH_DUMP_PATH: &str = "render_graph.dot";
 
+/// 管线缓存文件头 magic 与格式版本（R-07）。
+const PIPELINE_CACHE_MAGIC: [u8; 4] = *b"MRPC";
+const PIPELINE_CACHE_VERSION: u32 = 1;
+/// 管线缓存文件头大小：magic(4) + version(4) + key(8)。
+const PIPELINE_CACHE_HEADER_LEN: usize = 16;
+/// 管线状态标签：顶点布局/光栅化/深度等待机状态变化时递增，参与缓存键哈希。
+const PIPELINE_STATE_TAG: u32 = 1;
+
+/// FNV-1a 64 位哈希：跨进程稳定，仅用于管线缓存键命名，非安全用途。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 管线状态哈希：着色器字节码 + 状态标签（R-07 缓存键的第三分量）。
+fn pipeline_state_hash(shader_code: &[u32]) -> u64 {
+    let mut bytes = Vec::with_capacity(shader_code.len() * 4 + 4);
+    for word in shader_code {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&PIPELINE_STATE_TAG.to_le_bytes());
+    fnv1a64(&bytes)
+}
+
+/// 管线缓存磁盘目录（R-07）：Windows 用 `%LOCALAPPDATA%/Miriya/cache/pipeline`；
+/// Linux 占位等价路径 `XDG_CACHE_HOME`（缺省 `$HOME/.cache`）下的 `Miriya/cache/pipeline`。
+/// 环境变量缺失时返回 `None`（缓存静默降级为内存态）。
+fn pipeline_cache_dir() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)?
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+            })?
+    };
+    Some(base.join("Miriya").join("cache").join("pipeline"))
+}
+
 /// 查询 loader 是否提供 Khronos 校验层；缺失时调用方降级关闭而不是报错。
 fn validation_layer_available(entry: &Entry) -> bool {
     // SAFETY: `entry` 由当前进程加载的 Vulkan loader 构造，查询不依赖实例。
@@ -162,8 +206,8 @@ struct FrameResources {
 }
 
 struct PipelineResources {
-    vertex_module: vk::ShaderModule,
-    fragment_module: vk::ShaderModule,
+    /// 单 `.spv` 多入口模块（`vertexMain`/`fragmentMain`），两个 stage 共用。
+    shader_module: vk::ShaderModule,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     /// 每帧一个相机 UBO 描述符集，按下标与 `VulkanCore::frames` 对齐。
@@ -176,8 +220,7 @@ struct PipelineResources {
 /// 成功路径通过 [`PipelineGuard::defuse`] 移交所有权。
 struct PipelineGuard<'a> {
     device: &'a Device,
-    vertex_module: Option<vk::ShaderModule>,
-    fragment_module: Option<vk::ShaderModule>,
+    shader_module: Option<vk::ShaderModule>,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     pipeline_layout: Option<vk::PipelineLayout>,
@@ -191,15 +234,13 @@ impl PipelineGuard<'_> {
         mut self,
     ) -> (
         vk::ShaderModule,
-        vk::ShaderModule,
         vk::DescriptorSetLayout,
         vk::DescriptorPool,
         vk::PipelineLayout,
         vk::Pipeline,
     ) {
         (
-            self.vertex_module.take().expect("顶点着色器模块已创建"),
-            self.fragment_module.take().expect("片元着色器模块已创建"),
+            self.shader_module.take().expect("着色器模块已创建"),
             self.descriptor_set_layout.take().expect("描述符布局已创建"),
             self.descriptor_pool.take().expect("描述符池已创建"),
             self.pipeline_layout.take().expect("管线布局已创建"),
@@ -224,10 +265,7 @@ impl Drop for PipelineGuard<'_> {
             if let Some(layout) = self.descriptor_set_layout.take() {
                 self.device.destroy_descriptor_set_layout(layout, None);
             }
-            if let Some(module) = self.fragment_module.take() {
-                self.device.destroy_shader_module(module, None);
-            }
-            if let Some(module) = self.vertex_module.take() {
+            if let Some(module) = self.shader_module.take() {
                 self.device.destroy_shader_module(module, None);
             }
         }
@@ -284,6 +322,8 @@ struct MeshSlot {
 /// Vulkan 核心对象。按 frame → pipeline → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
     pipeline: Option<PipelineResources>,
+    /// 常驻管线缓存（R-07）；仅带 surface 路径创建，`Drop` 在 wait_idle 后销毁。
+    pipeline_cache: Option<vk::PipelineCache>,
     /// 每帧独立资源，环形复用；仅带 surface 路径创建。
     frames: Vec<FrameResources>,
     /// 当前使用的帧下标（环形递增）。
@@ -651,6 +691,7 @@ impl VulkanCore {
 
         Ok(Self {
             pipeline: None,
+            pipeline_cache: None,
             frames: Vec::new(),
             frame_index: 0,
             depth: None,
@@ -1397,47 +1438,44 @@ impl VulkanCore {
     }
 
     fn init_pipeline(&mut self) -> Result<(), String> {
-        const VERTEX_CODE: &[u32] =
-            vulkanalia::include_shader_code!("../../../shaders/cube/cube.vert.spv");
-        const FRAGMENT_CODE: &[u32] =
-            vulkanalia::include_shader_code!("../../../shaders/cube/cube.frag.spv");
+        // 单 .spv 多入口（R-06）：`cube.spv` 经 `-fvk-use-entrypoint-name` 编译，
+        // 同时包含 vertexMain/fragmentMain 两个入口，两个 stage 共用同一模块。
+        const SHADER_CODE: &[u32] =
+            vulkanalia::include_shader_code!("../../../shaders/cube/cube.spv");
+
+        // 管线缓存（R-07）：常驻 VkPipelineCache + 磁盘持久化；全部失败路径仅告警降级。
+        let state_hash = pipeline_state_hash(SHADER_CODE);
+        let (cache_key, cache_path) = self.pipeline_cache_key_and_path(state_hash);
+        let pipeline_cache = self.ensure_pipeline_cache(cache_key, cache_path.as_deref());
 
         // 失败回收守卫：任一步出错即销毁已创建对象，成功时 defuse 移交所有权。
         let mut guard = PipelineGuard {
             device: &self.device,
-            vertex_module: None,
-            fragment_module: None,
+            shader_module: None,
             descriptor_set_layout: None,
             descriptor_pool: None,
             pipeline_layout: None,
             pipeline: None,
         };
 
-        let vertex_info = vk::ShaderModuleCreateInfo::builder()
-            .code_size(VERTEX_CODE.len() * 4)
-            .code(VERTEX_CODE);
-        // SAFETY: VERTEX_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
-        let vertex_module = unsafe { self.device.create_shader_module(&vertex_info, None) }
-            .map_err(|error| format!("创建顶点着色器模块失败: {error}"))?;
-        guard.vertex_module = Some(vertex_module);
-        let fragment_info = vk::ShaderModuleCreateInfo::builder()
-            .code_size(FRAGMENT_CODE.len() * 4)
-            .code(FRAGMENT_CODE);
-        // SAFETY: FRAGMENT_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
-        let fragment_module = unsafe { self.device.create_shader_module(&fragment_info, None) }
-            .map_err(|error| format!("创建片元着色器模块失败: {error}"))?;
-        guard.fragment_module = Some(fragment_module);
+        let module_info = vk::ShaderModuleCreateInfo::builder()
+            .code_size(SHADER_CODE.len() * 4)
+            .code(SHADER_CODE);
+        // SAFETY: SHADER_CODE 是已校验的 SPIR-V 字节码，生命周期覆盖模块创建。
+        let shader_module = unsafe { self.device.create_shader_module(&module_info, None) }
+            .map_err(|error| format!("创建着色器模块失败: {error}"))?;
+        guard.shader_module = Some(shader_module);
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_module)
-                .name(b"main\0")
+                .module(shader_module)
+                .name(b"vertexMain\0")
                 .build(),
             vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_module)
-                .name(b"main\0")
+                .module(shader_module)
+                .name(b"fragmentMain\0")
                 .build(),
         ];
 
@@ -1627,9 +1665,10 @@ impl VulkanCore {
             .push_next(&mut rendering_info)
             .build();
         // SAFETY: 所有状态结构与着色器模块均有效；使用动态渲染无需 render pass。
+        // pipeline_cache 可能是 null（缓存创建失败时降级），对驱动同样合法。
         let pipelines = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(pipeline_cache, &[create_info], None)
         }
         .map_err(|error| format!("创建图形管线失败: {error:?}"))?
         .0;
@@ -1640,24 +1679,145 @@ impl VulkanCore {
         guard.pipeline = Some(pipeline);
 
         // 全部对象创建成功：从守卫移交所有权。
-        let (
-            vertex_module,
-            fragment_module,
-            descriptor_set_layout,
-            descriptor_pool,
-            layout,
-            pipeline,
-        ) = guard.defuse();
+        let (shader_module, descriptor_set_layout, descriptor_pool, layout, pipeline) =
+            guard.defuse();
         self.pipeline = Some(PipelineResources {
-            vertex_module,
-            fragment_module,
+            shader_module,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
             layout,
             pipeline,
         });
+        // 管线创建成功后写回缓存（R-07）；IO 失败仅告警，不阻塞。
+        if self.pipeline_cache.is_some() {
+            self.save_pipeline_cache(cache_key, cache_path.as_deref());
+        }
         Ok(())
+    }
+
+    /// 计算管线缓存键与磁盘路径（R-07）。键 = 设备 UUID + 驱动版本 + 管线状态哈希；
+    /// 目录不可用时路径为 `None`（仅内存态缓存）。
+    fn pipeline_cache_key_and_path(&self, state_hash: u64) -> (u64, Option<std::path::PathBuf>) {
+        // SAFETY: physical_device 由本实例创建且仍存活。
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        let uuid_hex: String = properties
+            .pipeline_cache_uuid
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut key_bytes = Vec::with_capacity(28);
+        key_bytes.extend_from_slice(properties.pipeline_cache_uuid.as_slice());
+        key_bytes.extend_from_slice(&properties.driver_version.to_le_bytes());
+        key_bytes.extend_from_slice(&state_hash.to_le_bytes());
+        let key = fnv1a64(&key_bytes);
+        let path = pipeline_cache_dir().map(|dir| {
+            dir.join(format!(
+                "{uuid_hex}_{}_{key:x}.bin",
+                properties.driver_version
+            ))
+        });
+        (key, path)
+    }
+
+    /// 创建（或复用）常驻管线缓存（R-07）。首次创建时尝试从磁盘加载；
+    /// 文件缺失为正常首启路径，损坏/IO 异常仅告警并退化为空缓存。
+    /// `VkPipelineCache` 本身创建失败时返回 null 缓存（对 `create_graphics_pipelines` 合法）。
+    fn ensure_pipeline_cache(
+        &mut self,
+        key: u64,
+        path: Option<&std::path::Path>,
+    ) -> vk::PipelineCache {
+        if let Some(cache) = self.pipeline_cache {
+            return cache;
+        }
+
+        // 读取缓存文件（文件级命中判定：magic + 版本 + 键一致，不做管线级 diff）。
+        let initial_data = path.and_then(|path| match std::fs::read(path) {
+            Ok(bytes) => {
+                if bytes.len() > PIPELINE_CACHE_HEADER_LEN
+                    && bytes[..4] == PIPELINE_CACHE_MAGIC
+                    && bytes[4..8] == PIPELINE_CACHE_VERSION.to_le_bytes()
+                    && bytes[8..16] == key.to_le_bytes()
+                {
+                    mir_log::info!(target: "vulkan", "管线缓存命中: {} 字节", bytes.len() - PIPELINE_CACHE_HEADER_LEN);
+                    Some(bytes[PIPELINE_CACHE_HEADER_LEN..].to_vec())
+                } else {
+                    mir_log::warn!(target: "vulkan", "管线缓存文件损坏或键不匹配，忽略重建: {}", path.display());
+                    None
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                mir_log::info!(target: "vulkan", "管线缓存未命中（首次启动）: {}", path.display());
+                None
+            }
+            Err(error) => {
+                mir_log::warn!(target: "vulkan", "管线缓存文件读取失败，忽略重建: {error}");
+                None
+            }
+        });
+
+        let cache = match &initial_data {
+            Some(data) => {
+                let info = vk::PipelineCacheCreateInfo::builder().initial_data(data);
+                // SAFETY: initial_data 在调用期间持有且内容有效。
+                unsafe { self.device.create_pipeline_cache(&info, None) }
+            }
+            None => {
+                let info = vk::PipelineCacheCreateInfo::builder();
+                // SAFETY: 空 info 有效。
+                unsafe { self.device.create_pipeline_cache(&info, None) }
+            }
+        };
+        match cache {
+            Ok(cache) => {
+                self.pipeline_cache = Some(cache);
+                cache
+            }
+            Err(error) => {
+                mir_log::warn!(target: "vulkan", "创建管线缓存失败，降级为无缓存: {error}");
+                vk::PipelineCache::null()
+            }
+        }
+    }
+
+    /// 把管线缓存写回磁盘（R-07）：magic + 版本 + 键头 + 驱动导出的缓存数据。
+    /// IO 失败仅告警，绝不阻塞/panic。
+    fn save_pipeline_cache(&self, key: u64, path: Option<&std::path::Path>) {
+        let Some(path) = path else { return };
+        let Some(cache) = self.pipeline_cache else {
+            return;
+        };
+        // SAFETY: cache 由本设备创建且有效；返回驱动导出的缓存数据。
+        let data = match unsafe { self.device.get_pipeline_cache_data(cache) } {
+            Ok(data) => data,
+            Err(error) => {
+                mir_log::warn!(target: "vulkan", "管线缓存导出失败，跳过写回: {error}");
+                return;
+            }
+        };
+        if data.is_empty() {
+            mir_log::warn!(target: "vulkan", "管线缓存导出为空，跳过写回");
+            return;
+        }
+        let mut bytes = Vec::with_capacity(PIPELINE_CACHE_HEADER_LEN + data.len());
+        bytes.extend_from_slice(&PIPELINE_CACHE_MAGIC);
+        bytes.extend_from_slice(&PIPELINE_CACHE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&data);
+        match std::fs::create_dir_all(path.parent().unwrap_or(path))
+            .and_then(|()| std::fs::write(path, &bytes))
+        {
+            Ok(()) => {
+                mir_log::info!(target: "vulkan", "管线缓存已写回: {} 字节", bytes.len());
+            }
+            Err(error) => {
+                mir_log::warn!(target: "vulkan", "管线缓存写回失败: {error}");
+            }
+        }
     }
 
     fn destroy_pipeline(&mut self) {
@@ -1672,9 +1832,7 @@ impl VulkanCore {
                 self.device
                     .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
                 self.device
-                    .destroy_shader_module(resources.fragment_module, None);
-                self.device
-                    .destroy_shader_module(resources.vertex_module, None);
+                    .destroy_shader_module(resources.shader_module, None);
             }
         }
     }
@@ -2158,6 +2316,10 @@ impl Drop for VulkanCore {
             }
             // 管线销毁必须发生在命令缓冲执行完毕之后。
             self.destroy_pipeline();
+            // 管线缓存随管线之后销毁（wait_idle 已在上方执行，R-07）。
+            if let Some(cache) = self.pipeline_cache.take() {
+                self.device.destroy_pipeline_cache(cache, None);
+            }
             self.destroy_depth_resources();
             self.destroy_all_meshes();
             self.device.destroy_command_pool(self.transfer_pool, None);

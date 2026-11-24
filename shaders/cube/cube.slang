@@ -1,5 +1,6 @@
 // v0.2 Cube：顶点缓冲 + 相机 UBO（binding 0）+ 逐实例 push constants（model/tint）。
-// 入口名由 Slang 默认写为 `main`，与 mir-render 的管线 `.name(b"main\0")` 一致（ADR-0011）。
+// 单 .spv 多入口（-fvk-use-entrypoint-name）：入口名 vertexMain/fragmentMain
+// 经 spirv 入口名保留，与 mir-render 管线的 `.name(b"vertexMain\0")` 等一致（ADR-0011）。
 
 struct VertexInput
 {

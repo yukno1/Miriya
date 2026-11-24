@@ -15,19 +15,19 @@ Slang 提供 module/import、泛型与抽象，并可直接生成 SPIR-V，适�
 
 1. **唯一着色器源语言**：所有新着色器使用 `.slang`，停止新增 GLSL 源码；仓库内示例 GLSL 源由 Slang 源替换。
 2. **目标格式不变**：继续使用 Vulkan 1.3 + SPIR-V；`slangc -target spirv` 直接生成字节码，不经 DXC/glslang。
-3. **入口约定**：单个 `.slang` module 可包含 `[shader("vertex")]` / `[shader("fragment")]` 两个入口函数
-   （当前为 `vertexMain` / `fragmentMain`），分别编译到两个 `.spv`；Slang 默认把 SPIR-V 入口名写为 `main`，
-   与当前 `mir-render` 的 `.name(b"main\0")` 保持一致。语义使用 `SV_VertexID`、`SV_Position`、
+3. **入口约定**：单个 `.slang` module 包含 `[shader("vertex")]` / `[shader("fragment")]` 两个入口函数
+   （`vertexMain` / `fragmentMain`）。2026-11-24 起经 `-fvk-use-entrypoint-name` 编译为**单个 `.spv`**，
+   SPIR-V 保留入口名，`mir-render` 各 stage 以 `.name(b"vertexMain\0")` / `.name(b"fragmentMain\0")`
+   绑定同一 ShaderModule（R-06 已落地）。语义使用 `SV_VertexID`、`SV_Position`、
    `TEXCOORD0`、`SV_Target`，并校验 location 与管线输入一致。
 4. **离线预编译**：`.spv` 继续提交进仓库并由 `include_shader_code!` 在编译期嵌入；运行时不引入 Slang 编译器。
 5. **工具链入 CI**：Windows/Linux CI 安装固定版本 `slangc`，从 `.slang` 重新生成 `.spv`，并用
    `git diff --exit-code` 检查提交产物与源码一致。`slangc` 默认执行 SPIR-V 校验；本地可另跑 `spirv-val`。
-6. **后续归属**：M2 剩余工作保持当前加载方式；M5 的公共代码用 Slang module/import 组织；M13 的 shader 预编译
+6. **后续归属**：M5 的公共代码用 Slang module/import 组织；M13 的 shader 预编译
    与缓存由 `mir-build`/`miriya-cli` 收编。
 7. ADR 0004 的渲染管线、RenderGraph 与帧结构决策不变，仅第 5 条着色器语言决策由本 ADR 取代。
-8. **单 `.spv` 多入口延后**：当前继续按阶段输出两个 `.spv`，保持 `mir-render` 的入口名约定不变；
-   待 M2 RenderGraph 重构时一并改为单个 shader module 多 entry，届时配合 `-fvk-use-entrypoint-name`
-   并调整 Rust 侧各阶段的 `.name(...)` 绑定。
+8. ~~单 `.spv` 多入口延后~~ **已完成（2026-11-24）**：随 M2 RenderGraph 重构落地，`slangc
+   -fvk-use-entrypoint-name` 单文件编译，Rust 侧单 ShaderModule 按入口名绑定。
 
 ## 替代方案
 
