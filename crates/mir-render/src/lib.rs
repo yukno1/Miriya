@@ -2,13 +2,15 @@
 //!
 //! 公共 API 不暴露任何 Vulkan 类型；`VulkanCore` 完全封装在 crate 内部
 //! （ADR 0005 / README §5.1 规则 2）。当前已接入实例、物理设备、逻辑设备、
-//! 队列选择、surface 与交换链；RenderGraph / 绘制 / present 仍待后续里程碑。
+//! 队列选择、surface、交换链、多帧在飞行（批次 A）与 RenderGraph v0.5
+//! （批次 B：声明式 pass/资源 + 编译期 barrier 推导 + GPU pass 时间戳 + 依赖图 dump）。
 //!
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
 
 mod frame;
 mod geometry;
+mod graph;
 mod mesh;
 mod vulkan;
 
@@ -87,6 +89,8 @@ pub struct RenderContext {
     draws: Vec<frame::DrawInstance>,
     frame_error: Option<String>,
     validation: bool,
+    /// 每帧把 RenderGraph 依赖图 dump 成 DOT 文件（批次 B R-05）。
+    graph_dump: bool,
 }
 
 impl RenderContext {
@@ -104,12 +108,21 @@ impl RenderContext {
             draws: Vec::new(),
             frame_error: None,
             validation: default_validation(),
+            graph_dump: false,
         }
     }
 
     /// 覆盖校验层开关；需在 `init` / `init_with_window` 之前调用。
     pub fn with_validation(mut self, enabled: bool) -> Self {
         self.validation = enabled;
+        self
+    }
+
+    /// 覆盖 RenderGraph 依赖图 dump 开关；需在 `init` / `init_with_window` 之前调用。
+    ///
+    /// 开启后每帧把依赖图 DOT 写入工作目录下的 `render_graph.dot`（调试用，默认关闭）。
+    pub fn with_graph_dump(mut self, enabled: bool) -> Self {
+        self.graph_dump = enabled;
         self
     }
 
@@ -126,7 +139,7 @@ impl RenderContext {
             return;
         }
         match VulkanCore::new_headless(self.validation) {
-            Ok(backend) => {
+            Ok(mut backend) => {
                 self.status = RendererStatus::Vulkan {
                     device_name: backend.device_name().to_string(),
                     api_version: backend.api_version().to_string(),
@@ -137,6 +150,7 @@ impl RenderContext {
                     present_mode: backend.present_mode().map(str::to_string),
                     swapchain_image_count: backend.swapchain_image_count(),
                 };
+                backend.set_graph_dump(self.graph_dump);
                 self.backend = Some(backend);
             }
             Err(error) => {
@@ -159,7 +173,7 @@ impl RenderContext {
             return Err(RenderInitError::AlreadyInitialized);
         }
         match VulkanCore::with_surface(display, window, self.width, self.height, self.validation) {
-            Ok(backend) => {
+            Ok(mut backend) => {
                 self.status = RendererStatus::Vulkan {
                     device_name: backend.device_name().to_string(),
                     api_version: backend.api_version().to_string(),
@@ -170,6 +184,7 @@ impl RenderContext {
                     present_mode: backend.present_mode().map(str::to_string),
                     swapchain_image_count: backend.swapchain_image_count(),
                 };
+                backend.set_graph_dump(self.graph_dump);
                 self.backend = Some(backend);
                 self.initialized = true;
                 Ok(())
@@ -195,6 +210,22 @@ impl RenderContext {
     /// 最近一帧的错误（无交换链/无后端时为 `None`）。
     pub fn frame_error(&self) -> Option<&str> {
         self.frame_error.as_deref()
+    }
+
+    /// 运行时开关 RenderGraph 依赖图 dump（初始化前后均可调用）。
+    pub fn set_graph_dump(&mut self, enabled: bool) {
+        self.graph_dump = enabled;
+        if let Some(backend) = self.backend.as_mut() {
+            backend.set_graph_dump(enabled);
+        }
+    }
+
+    /// 上一帧各 GPU pass 的耗时（毫秒；headless / 不支持时间戳时为空）。
+    pub fn pass_timings(&self) -> &[(String, f32)] {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.last_pass_timings())
+            .unwrap_or(&[])
     }
 
     /// 当前渲染目标尺寸（随窗口缩放更新）。
