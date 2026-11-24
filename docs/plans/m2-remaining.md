@@ -1,7 +1,7 @@
 # M2 剩余任务清单（多帧在飞行 → RenderGraph → 显存/管线基础设施 → 材质与 PBR）
 
-- 日期：2026-11-24（批次 A 于同日完成）
-- 状态：**批次 A 已完成**（R-01/R-02 落地；R-03 起未开工）
+- 日期：2026-11-24（批次 A、B 于同日完成）
+- 状态：**批次 A、B 已完成**（R-01…R-05 落地；批次 C 起未开工）
 - 关联：README §8.2（M2）、§8.3（v0.3 垂直切片）、§9.6、§14.4；ADR-0004（渲染管线与 RenderGraph）、
   ADR-0011（Slang，第 8 条多入口延后）、ADR-0012（帧数据/提交边界，第 5 条临时取舍）；`docs/plans/v0.2-cube.md`
 - 估算：**约 12.5 净人日**（批次 A 1.5 + B 3.5 + C 0.5 + D 1.0 + E 3.0 + F 5.0，含 0.5 冗余）
@@ -282,7 +282,14 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
 
 | 项 | 命令/方式 | 结果 | 日期 |
 |---|---|---|---|
-| （待执行） | | | |
+| （批次 A 记录见批次 A 小节；以下为批次 B） | | | |
+| 单测 | `cargo test --workspace` | ✅ 全部套件 ok（`mir-render` 34 项，含 13 项新增 graph 单测），0 失败 | 2026-11-24 |
+| 格式/静态检查 | `cargo fmt --all -- --check`；`cargo clippy --workspace --all-targets -- -D warnings` | ✅ 通过（仅 Cargo 清单既有 unused dependency 警告） | 2026-11-24 |
+| 校验层 | `cargo run -- --validation --frames 120` | ✅ 0 validation 消息，57.5 FPS；barrier 全部由图编译器生成（synchronization2） | 2026-11-24 |
+| dump/时间戳 | `cargo run -- --validation --frames 120 --graph-dump --stats` | ✅ `render_graph.dot` 内容与实际 pass/资源一致；`main_geometry` pass 平均 0.023 ms | 2026-11-24 |
+| 1080p 帧率 | `cargo run --release -- --validation --frames 600 --width 1920 --height 1080` | ✅ 600 帧完成，平均 58.2 FPS，0 validation 消息（与批次 A 基线 57.7 持平） | 2026-11-24 |
+| headless 回归 | `cargo run --release -- --headless --frames 1000 --no-validation` | ✅ 1000 帧完成，退出正常 | 2026-11-24 |
+| 交换链重建路径 | 单测 `minimized_window_skips_frame`（真实 GPU：resize(0,0) → resize(800,600) 触发重建） | ✅ 通过；拖拽 resize 手测留待批次 C 一并回归（graph 每帧重建，重建路径与批次 A 同构） | 2026-11-24 |
 
 ## 10. 执行记录
 
@@ -307,3 +314,27 @@ R-01 → R-02 ─┬─ R-03 → R-04 ─┬─ R-05
   （仅 Cargo 清单既有 unused dependency 警告）。
 - 手测路径（resize/最小化/Alt+Tab）本次未逐项重演：交换链重建路径仅新增"遍历全部帧更新 extent / 重建 render_finished"，
   与 v0.2 已验证逻辑同构，留待批次 B 改动 barrier 时一并回归。
+
+### 2026-11-24：批次 B——RenderGraph v0.5（R-03/R-04/R-05 已完成）
+
+| 项 | 改动 |
+|---|---|
+| 数据模型（R-03） | 新增 `crates/mir-render/src/graph.rs`（纯数据，无 `vk::*`）：`RenderGraph`/`PassId`/`ResourceId`/`PassDesc`（Graphics{color,depth} / Transfer{reads,writes}）/`ResourceDesc`（TransientImage/ImportedImage{initial,final}/ImportedBuffer）；`VulkanCore::build_frame_graph` 每帧声明：imported 交换链图像（UNDEFINED→PRESENT）、深度图像（初始即 DEPTH_ATTACHMENT_OPTIMAL）与绘制引用的网格 buffer，单个 graphics pass `main_geometry` |
+| 编译器（R-04） | 名字去重/未知资源/用法匹配校验 → 数据流边（RAW/WAR/WAW，跳过同 pass 内部）→ Kahn 拓扑排序（同层按声明序，环检测报 `CycleDetected`）→ 逐资源布局追踪生成前置 barrier、帧末按 imported `final_layout` 生成收尾 barrier（含 aspect/阶段/访问推导）。语义约定：pass 按声明序执行，同一资源「先读后写」的跨 pass 对判定为数据流矛盾（环） |
+| 接管录制 | `render_frame` 改为「图声明 → compile →（可选 dump）→ 时间戳回读 → 复位查询池 → 逐 pass：前置 barrier（`cmd_pipeline_barrier2`，synchronization2 已在 `Vulkan13Features` 启用并探测）→ `cmd_write_timestamp2` TOP_OF_PIPE → Graphics 分支执行原渲染/绘制块 → BOTTOM_OF_PIPE → 帧末 barrier」。v0.2 的 acquire 后/呈现前两处手写 barrier 删除；深度一次性转换保留在创建路径（并入 imported 初始布局语义）；网格上传 staging barrier 不动 |
+| 别名（R-05） | 编译器为 transient 图像按拓扑序计算生命周期，贪心复用不重叠槽位（`CompiledGraph::alias_slots`）；v0.5 实际帧图暂无 transient 资源，模型与单测先行 |
+| 时间戳（R-05） | 每帧资源新增时间戳查询池（TIMESTAMP，64 查询 = 32 pass 上限，不支持时间戳的队列族自动关闭）；fence 等待后回读上一轮结果（64-bit + WAIT，`timestamp_period` 换算毫秒）进 `VulkanCore::last_pass_timings`；`RenderContext::pass_timings()` 公开；`FrameStats`（mir-core）新增 `gpu_pass_timings` 字段 |
+| dump（R-05） | `RenderGraph::dump_dot` 输出 DOT（资源/pass 节点 + 读写边 + barrier 标注 + 别名注释）；`--graph-dump` CLI 开关经 `RenderContext::with_graph_dump`/`set_graph_dump` 转发，每帧覆盖写 `render_graph.dot`，IO 失败仅告警一次 |
+| CLI | `miriya-app` 新增 `--graph-dump`、`--stats`（回读 pass 耗时进 FrameStats，每 300 帧快照 + 退出时平均耗时） |
+| 单测 | 新增 13 项 graph 单测：acquire/present barrier 生成与深度静态布局、名字/资源/用法/重复附件校验、transfer 顺序、先读后写与互为输入输出环检测、transient 别名（重叠/不重叠）、空图、DOT dump、阶段标签；`cargo test -p mir-render` 34 项全过 |
+
+验证（2026-11-24）：
+
+- `cargo run -- --validation --frames 120`：**0 validation 消息**，57.5 FPS——每帧 barrier 全部由图编译器生成（Gate 2 达成）。
+- `cargo run -- --validation --frames 120 --graph-dump --stats`：`render_graph.dot` 与实际 pass/资源一致（人工核对：swapchain UNDEFINED→COLOR_ATTACHMENT 前置、COLOR_ATTACHMENT→PRESENT 帧末、depth 无 barrier）；`main_geometry` 平均 0.023 ms。
+- `cargo run --release -- --validation --frames 600 --width 1920 --height 1080`：600 帧完成，58.2 FPS，0 validation 消息。
+- `cargo test --workspace` 全过（新增 13 项）；`cargo fmt --all -- --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过（仅既有 unused dependency 清单警告）。
+- `cargo run --release -- --headless --frames 1000 --no-validation` 行为不变（graph 路径 headless 空转）。
+- 实现备注：vulkanalia 0.35 的 `get_query_pool_results` 以字节切片 + stride 暴露，回读按 8 字节对齐转 u64；`PipelineStageFlags2` 中旧 `TRANSFER` 位命名为 `ALL_TRANSFER`。
+
+下一步：批次 C（R-06 单 `.spv` 多入口）与批次 D（R-07 管线缓存持久化）均只依赖 R-04，可并行推进；关键路径继续走批次 E（R-08 子分配器）。

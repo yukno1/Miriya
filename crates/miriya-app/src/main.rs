@@ -21,10 +21,18 @@ struct Game {
     camera: Camera,
     camera_controller: CameraController,
     looking: bool,
+    /// `--stats`：收集 GPU pass 耗时并定期输出。
+    stats_enabled: bool,
+    /// `--graph-dump`：每帧 dump RenderGraph 依赖图。
+    graph_dump: bool,
+    /// `--stats` 时累计各 pass 的 GPU 耗时（毫秒），退出时输出平均值。
+    pass_time_total: Vec<(String, f64)>,
+    /// 参与 GPU 耗时统计的帧数。
+    pass_time_frames: u32,
 }
 
 impl Game {
-    fn new() -> Self {
+    fn new(stats_enabled: bool, graph_dump: bool) -> Self {
         let mut world = World::new();
         let mut cubes = Vec::with_capacity(10);
 
@@ -75,6 +83,10 @@ impl Game {
             camera,
             camera_controller: CameraController::default(),
             looking: false,
+            stats_enabled,
+            graph_dump,
+            pass_time_total: Vec::new(),
+            pass_time_frames: 0,
         }
     }
 }
@@ -86,6 +98,10 @@ impl AppState for Game {
             ctx.renderer.size().0,
             ctx.renderer.size().1
         );
+        // RenderGraph 依赖图 dump 初始化后仍可开关（每帧覆盖写 render_graph.dot）。
+        if self.graph_dump {
+            ctx.renderer.set_graph_dump(true);
+        }
     }
 
     fn on_update(&mut self, ctx: &mut EngineContext, dt: f32) {
@@ -168,6 +184,42 @@ impl AppState for Game {
         }
 
         ctx.renderer.end_frame();
+
+        // --stats：回读 GPU pass 耗时进 FrameStats，累计并每 300 帧输出快照。
+        if self.stats_enabled {
+            let timings: Vec<(String, f32)> = ctx.renderer.pass_timings().to_vec();
+            if !timings.is_empty() {
+                self.pass_time_frames += 1;
+                for (name, ms) in &timings {
+                    match self
+                        .pass_time_total
+                        .iter_mut()
+                        .find(|(total_name, _)| total_name == name)
+                    {
+                        Some((_, total)) => *total += f64::from(*ms),
+                        None => self.pass_time_total.push((name.clone(), f64::from(*ms))),
+                    }
+                }
+            }
+            ctx.stats.gpu_pass_timings = timings;
+            if ctx.stats.frames > 0 && ctx.stats.frames % 300 == 0 {
+                let snapshot = if ctx.stats.gpu_pass_timings.is_empty() {
+                    "GPU pass：无数据".to_string()
+                } else {
+                    let parts: Vec<String> = ctx
+                        .stats
+                        .gpu_pass_timings
+                        .iter()
+                        .map(|(name, ms)| format!("{name}: {ms:.3} ms"))
+                        .collect();
+                    format!("GPU pass：{}", parts.join("，"))
+                };
+                println!(
+                    "[stats] 帧 {}，FPS {:.1}，{}",
+                    ctx.stats.frames, ctx.stats.fps, snapshot
+                );
+            }
+        }
     }
 
     fn on_exit(&mut self, ctx: &mut EngineContext) {
@@ -175,6 +227,15 @@ impl AppState for Game {
             "游戏退出：共 {} 帧，平均 {:.1} FPS",
             ctx.stats.frames, ctx.stats.fps
         );
+        if self.stats_enabled && self.pass_time_frames > 0 {
+            println!("GPU pass 平均耗时（{} 帧统计）：", self.pass_time_frames);
+            for (name, total) in &self.pass_time_total {
+                println!(
+                    "  {name}: {:.3} ms",
+                    total / f64::from(self.pass_time_frames)
+                );
+            }
+        }
         if let Some(error) = ctx.renderer.frame_error() {
             eprintln!("渲染帧错误：{error}");
         }
@@ -198,6 +259,8 @@ fn main() {
     } else {
         EngineConfig::default().validation
     };
+    let stats_enabled = args.iter().any(|arg| arg == "--stats");
+    let graph_dump = args.iter().any(|arg| arg == "--graph-dump");
 
     let config = EngineConfig {
         title: "Miriya Demo".to_string(),
@@ -208,7 +271,7 @@ fn main() {
         validation,
     };
     let engine = miriya_engine::Engine::new(config);
-    let mut game = Game::new();
+    let mut game = Game::new(stats_enabled, graph_dump);
 
     if headless {
         engine.run_headless(&mut game, max_frames.unwrap_or(1000));
