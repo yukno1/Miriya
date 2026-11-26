@@ -7,3 +7,8 @@ description = "Miriya command line tools"
 [[bin]]
 name = "miriya-cli"
 path = "src/main.rs"
+
+[dependencies]
+mir-build = { path = "../mir-build" }
+anyhow = { workspace = true }
+clap = { workspace = true }

@@ -122,6 +122,8 @@ fn tick(
     frame_start: Instant,
     target: Option<f64>,
 ) {
+    // 资产完成队列只在主线程结算；IO/解码已由 rayon 作业池完成（ADR-0013）。
+    ctx.assets.poll();
     ctx.time.update();
     let dt = ctx.time.delta_secs();
     app.on_update(ctx, dt);
@@ -210,6 +212,7 @@ impl Engine {
         mir_window::run(window_config, &mut driver);
 
         driver.app.on_exit(&mut driver.ctx);
+        driver.ctx.assets.shutdown();
     }
 
     /// 无窗口运行指定帧数（headless 测试用）；不创建事件循环。
@@ -227,6 +230,7 @@ impl Engine {
         }
 
         app.on_exit(&mut ctx);
+        ctx.assets.shutdown();
     }
 }
 

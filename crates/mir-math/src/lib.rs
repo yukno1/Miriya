@@ -12,7 +12,6 @@ pub mod transform;
 pub mod vec;
 
 pub use frustum::{Aabb, Frustum};
-pub use interop::*;
 pub use mat::{Mat3, Mat4};
 pub use quat::Quat;
 pub use transform::Transform;

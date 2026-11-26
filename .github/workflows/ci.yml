@@ -57,6 +57,11 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      - name: Cook demo assets and verify golden
+        run: |
+          cargo run -p miriya-cli -- cook assets/fixtures --output assets/demo
+          git diff --exit-code -- assets/demo
+
       - name: Build managed runtime
         run: dotnet build managed/Miriya.Runtime/Miriya.Runtime.csproj -c Release
 

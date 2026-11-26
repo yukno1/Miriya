@@ -1,5 +1,6 @@
 //! Miriya 示例应用：展示如何基于 engine crate 搭建游戏。
 
+use miriya_engine::asset::{AudioAsset, Handle};
 use miriya_engine::core::{AppState, EngineConfig, EngineContext};
 use miriya_engine::input::{KeyCode, MouseButton};
 use miriya_engine::math::interop::{
@@ -26,6 +27,9 @@ struct Game {
     props: Vec<(ActorId, Prop, usize)>,
     /// 阵列中心的 Actor（自转圆环），用于逐帧更新。
     center: ActorId,
+    /// M4 资产路径：cook 后的示例音频；缺失时保留程序化几何回退。
+    audio_handle: Option<Handle<AudioAsset>>,
+    asset_ready_reported: bool,
     /// 网格句柄（渲染初始化后才能创建，故惰性创建）。
     meshes: Option<(MeshHandle, MeshHandle, MeshHandle)>,
     mesh_failed: bool,
@@ -127,6 +131,8 @@ impl Game {
             level,
             props,
             center,
+            audio_handle: None,
+            asset_ready_reported: false,
             meshes: None,
             mesh_failed: false,
             materials: Vec::new(),
@@ -201,6 +207,15 @@ impl AppState for Game {
             ctx.renderer.size().0,
             ctx.renderer.size().1
         );
+        // M4：资产根目录相对仓库；cook 产物缺失时走程序化回退，不阻塞启动。
+        ctx.assets.set_root("assets");
+        match ctx.assets.load::<AudioAsset>("demo/tone.miasset") {
+            Ok(handle) => {
+                self.audio_handle = Some(handle);
+                println!("资产请求已提交：demo/tone.miasset");
+            }
+            Err(error) => eprintln!("资产请求失败：{error}"),
+        }
         // RenderGraph 依赖图 dump 初始化后仍可开关（每帧覆盖写 render_graph.dot）。
         if self.graph_dump {
             ctx.renderer.set_graph_dump(true);
@@ -208,6 +223,13 @@ impl AppState for Game {
     }
 
     fn on_update(&mut self, ctx: &mut EngineContext, dt: f32) {
+        if !self.asset_ready_reported
+            && let Some(handle) = self.audio_handle
+            && ctx.assets.get(handle).is_some()
+        {
+            println!("异步资产已就绪：demo/tone.miasset");
+            self.asset_ready_reported = true;
+        }
         // 右键按住捕获光标并控制视角；失焦时平台层会清空鼠标状态，自动释放。
         if ctx.input.just_mouse_pressed(MouseButton::Right) {
             self.looking = true;

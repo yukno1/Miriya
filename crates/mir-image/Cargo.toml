@@ -3,3 +3,7 @@ name = "mir-image"
 version.workspace = true
 edition.workspace = true
 description = "Miriya image decoding"
+
+[dependencies]
+image = { workspace = true }
+thiserror = { workspace = true }

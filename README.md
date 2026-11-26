@@ -8,7 +8,7 @@
 | 项目信息 | 说明 |
 |---|---|
 | 上游基线 | Unreal Engine **5.8.4**（同机目录 `../UnrealEngine`，仅作行为参考） |
-| 当前阶段 | **M3 · 场景与 ECS 已达成**（下一步 M4 资产管线） |
+| 当前阶段 | **M4 · 资产管线已达成**（下一步 M5 材质与光照） |
 | 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
 | 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
 | 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
@@ -470,14 +470,15 @@ Miriya/
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
 | `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化、自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统（per-material UBO + 世代句柄）、基础 PBR（GGX metallic-roughness + 单方向光）、视锥剔除（extract 侧） | 🟡 原型 | 多光源/纹理/IBL、glTF 资产（M4/M5） |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
-| `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
+| `mir-asset` | UUIDv7 `AssetId`、类型化句柄、注册表/依赖图/缓存分离、rayon 异步加载、`.miasset` 分块 zstd 容器、glTF/PNG/KTX2/WAV/OGG 导入、notify 热重载与可诊断错误 | ✅ 可用 | M5 纹理 GPU 上传；M13 接入 cook/pack |
+| `mir-image` | PNG → RGBA8、KTX2 头解析与透传、图像数据错误化 | ✅ 可用 | M5 纹理采样/压缩格式支持 |
 | `mir-scene` | `Level`/`ActorId`/`ActorMeta`/`Parent`/`Children`、拓扑序世界矩阵、父子循环检测、稳定 ID 场景快照、自由相机 | ✅ 可用 | M4 接入资产引用；M6 物理组件；M7 游戏框架 |
-| `mir-serialize` | 版本化快照头（magic/version/schema hash）+ postcard 编解码与可诊断错误 | ✅ 可用 | M4 资产容器 `.miasset` 复用版本化头 |
+| `mir-serialize` | 版本化快照头（magic/version/schema hash）+ postcard 编解码与可诊断错误 | ✅ 可用 | M13 打包清单复用版本化头 |
 | `mir-log` | 全局 logger、五级宏、控制台输出、含单元测试，纯 std | ✅ 可用 | `tracing` 桥接、文件/异步 writer（M1） |
 | `mir-physics` | `PhysicsBackend` 契约、世代句柄、`FixedStep`、查询/接触事件/调试数据、`NullPhysicsBackend`、可复用契约测试；无求解器 | 🟡 契约 | 引擎侧胶水与外部后端接入（M6） |
 | `mir-editor-core` | UI 无关的文档/选择/类型化命令与撤销栈/Inspector 字段描述/视口数学/PIE 状态机，headless 测试 | 🟡 契约 | 完整编辑器核心与 UI 后端 spike（M12） |
 
-> 现状细节与已知问题见 §14。除上表 12 个已有内容的子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
+> 现状细节与已知问题见 §14。除上表 14 个已有内容的子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
 > 仓库不包含任何物理求解器实现。
 
 ---
@@ -669,12 +670,12 @@ Miriya/
 
 ### 9.7 `mir-asset`：资产服务器
 
-- `AssetId`（UUIDv7）+ `AssetRegistry`（路径/类型/依赖，不加载内容）；`Handle<T>` 引用计数。
-- 异步加载：作业池解码，主线程只做 GPU 上传与依赖解析；句柄查询不阻塞。
-- `Importer` trait：glTF（首选，含 Draco 可选）、PNG/KTX2、WAV/OGG/FLAC；FBX 后置（评估 `ufbx`）。
-- 热重载：`notify` 监听源资产，构建哈希比对后重建；编辑器与运行时行为一致。
-- 错误策略：解析错误返回 `AssetError` 并记录资产 ID，不 panic；损坏资产隔离，不拖垮进程。
-- 验收：冷启动 1 GB 资产不阻塞主线程超过 1 帧；热重载 ≤ 200 ms。
+- M4 已落地 `AssetId`（UUIDv7）+ `AssetRegistry`（路径/类型/依赖/哈希，不持有内容）+ 类型化 `Handle<A>`；缓存与注册表分离。
+- 异步加载：rayon 作业池执行 IO/解码/解压/哈希；主线程 `AssetServer::poll()` 只消费完成队列，GPU 上传留待 M5。
+- `Importer` trait 与实现：GLB 网格/PBR 材质（坐标转换在 `mir-math::interop`）、PNG/KTX2 纹理、WAV/OGG 音频；FLAC/FBX 后置。
+- `.miasset`：`MIRI` magic/version/schema hash + 64 KiB 分块 zstd + checksum；损坏输入与版本不匹配返回 `AssetError`。
+- 热重载：`notify` 事件 → 内容哈希比对 → 反向依赖拓扑失效；`reload_latency_ms()` 可观测。
+- 验收：1 GB 冷加载主线程单次 poll 最大 10.174 ms（≤ 16 ms）；热重载作业 ≤ 200 ms；保存→加载→再保存 golden 一致。
 
 ### 9.8 `mir-input`：输入动作
 
@@ -1066,15 +1067,19 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   `mir-serialize` 落地版本化场景快照；示例迁移到 Actor API 且世界空间 AABB 剔除正确。
   10k Actor 世界矩阵基准：扁平 0.10 ms / 纵深 0.36 ms；release 1080p 600 帧 58.2 FPS、校验层 0 error；
   保存→加载→再保存 golden 一致。详见 `docs/plans/m3-scene-ecs.md` §8/§9。
+- [x] **M4（资产管线）**：`AssetId`/`AssetRegistry`/依赖图/类型化缓存、rayon 异步加载与主线程 `poll()`、
+  `.miasset` 分块 zstd 容器、GLB/PNG/KTX2/WAV/OGG 导入、`notify` 热重载与 `miriya-cli cook`。
+  示例通过 `demo/tone.miasset` 验证异步资产路径并保留程序化回退；1 GB 冷加载单次 poll 最大 10.174 ms，
+  热重载 ≤ 200 ms，release 1080p 600 帧 58.3 FPS、校验层 0 error；详见 `docs/plans/m4-asset-pipeline.md`。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
-1. 26 个空壳 crate 尚未实现；`miriya-engine` 已 re-export 既有数学/ECS/场景/序列化子系统，其余新模块随后续里程碑接入。
+1. 24 个空壳 crate 尚未实现；`miriya-engine` 已 re-export 既有数学/ECS/场景/序列化/资产子系统，其余新模块随后续里程碑接入。
 2. ECS 已由 `hecs` 门面承载：世代 `Entity`、Resource 与 Added/Changed 可用；`Schedule`/并行查询/变更过滤仍待 M7 接入。
 3. `mir-render` 已具备深度、网格、逐实例绘制、校验层、多帧在飞行、RenderGraph v0.5、单 `.spv` 多入口、
    持久化管线缓存、自研显存子分配器、材质系统、基础 PBR 与视锥剔除（M2 批次 A–F 全部完成）；
-   多光源/纹理采样/IBL 为 M5，glTF 资产导入为 M4。
-4. `mir-asset` 加载失败直接 `panic`；异步加载与错误化在 M4 处理。
+   多光源/纹理采样/IBL 为 M5；GLB 网格/PBR 参数导入已在 M4 落地，但纹理绑定仍需 M5。
+4. `mir-asset` 已完成错误化、异步加载与热重载；纹理 GPU 上传/采样仍待 M5，FLAC/FBX 导入留待后续。
 5. Git 仓库已初始化且已推送到 `origin/main`；本地工作区需随每次里程碑同步提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
 7. `vulkanalia` 已接入 `mir-render` 且校验层可用；.NET 11 宿主仍未接入；
@@ -1106,6 +1111,12 @@ cargo run -- --validation --frames 120
 # M3 层级基准与场景 golden（跨 crate 集成测试）
 cargo bench -p mir-scene --bench hierarchy
 cargo test -p miriya-integration-tests
+
+# M4 cook 与资产 golden
+cargo run -p miriya-cli -- cook assets/fixtures --output assets/demo
+cargo test -p miriya-integration-tests asset_pipeline
+# 1 GB 冷加载 opt-in 基准（默认 64 MB）
+$env:MIRIYA_ASSET_BENCH_1GB='1'; cargo test -p miriya-integration-tests cold_load_poll_benchmark -- --ignored --nocapture
 
 # Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
 cargo run -p mir-vulkan-probe
@@ -1140,7 +1151,9 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
       任务清单与验收 Gate 见 `docs/plans/m2-remaining.md` §9/§10。
 - [x] **M3（场景与 ECS）**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene`
       收敛到 `mir-math`，演示单位按 ADR-0012 校准为厘米。Gate 与验收记录见 `docs/plans/m3-scene-ecs.md`。
-- [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
+- [x] **M4（资产管线）**：UUIDv7 AssetId、注册表/依赖图/缓存分离、rayon 异步加载、`.miasset` 分块 zstd 容器、
+  GLB/PNG/KTX2/WAV/OGG 导入、notify 热重载与 `miriya-cli cook`；Gate 与验收记录见 `docs/plans/m4-asset-pipeline.md`。
+- [ ] **M5–M13**：按 §8.2 依次推进光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）；每次里程碑结束同步 §14 与 `docs/plans/`。
 
 ---

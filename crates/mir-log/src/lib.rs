@@ -99,9 +99,9 @@ mod tests {
 
     #[test]
     fn level_threshold() {
-        set_max_level(Level::Error);
-        assert!(Level::Error.at_least(max_level()));
-        assert!(!Level::Info.at_least(max_level()));
-        set_max_level(Level::Trace);
+        // 不修改全局等级，避免与 logger::set_and_dispatch 并发竞争。
+        assert!(Level::Error.at_least(Level::Error));
+        assert!(!Level::Info.at_least(Level::Error));
+        assert!(Level::Trace.at_least(Level::Trace));
     }
 }

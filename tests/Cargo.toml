@@ -11,7 +11,13 @@ path = "src/lib.rs"
 name = "scene_roundtrip"
 path = "scene_roundtrip.rs"
 
+[[test]]
+name = "asset_pipeline"
+path = "asset_pipeline.rs"
+
 [dev-dependencies]
+mir-asset = { path = "../crates/mir-asset" }
+mir-build = { path = "../tools/mir-build" }
 mir-math = { path = "../crates/mir-math" }
 mir-scene = { path = "../crates/mir-scene" }
 mir-serialize = { path = "../crates/mir-serialize" }

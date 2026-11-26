@@ -35,6 +35,26 @@ pub fn centimeters_to_meters_vec3(v: Vec3) -> Vec3 {
     v * METERS_PER_CENTIMETER
 }
 
+/// glTF 的 Y-up 右手系 → 运行时 Z-up 左手系（仅旋转，不改单位）。
+///
+/// 映射：`(x, y, z) -> (x, -z, y)`。法线/切线复用同一旋转，保持不变式。
+#[inline]
+pub fn gltf_y_up_to_z_up(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, -v.z, v.y)
+}
+
+/// glTF 位置（米、Y-up）→ 运行时位置（厘米、Z-up）。
+#[inline]
+pub fn gltf_position_to_runtime([x, y, z]: [f32; 3]) -> Vec3 {
+    meters_to_centimeters_vec3(gltf_y_up_to_z_up(Vec3::new(x, y, z)))
+}
+
+/// glTF 法线/方向（Y-up）→ 运行时方向（Z-up，单位不变）。
+#[inline]
+pub fn gltf_direction_to_runtime([x, y, z]: [f32; 3]) -> Vec3 {
+    gltf_y_up_to_z_up(Vec3::new(x, y, z)).normalized()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +71,21 @@ mod tests {
             centimeters_to_meters_vec3(Vec3::new(100.0, -200.0, 50.0)),
             Vec3::new(1.0, -2.0, 0.5)
         );
+    }
+
+    #[test]
+    fn gltf_y_up_maps_to_runtime_z_up_and_centimeters() {
+        // glTF 上方向 (0,1,0) → 运行时 Z-up (0,0,1)，米→厘米。
+        assert_eq!(
+            gltf_position_to_runtime([0.0, 1.0, 0.0]),
+            Vec3::new(0.0, 0.0, 100.0)
+        );
+        // glTF 前方 -Z → 运行时 +Y（左手系右向语义由相机层定义）。
+        assert_eq!(
+            gltf_position_to_runtime([0.0, 0.0, -1.0]),
+            Vec3::new(0.0, 100.0, 0.0)
+        );
+        let normal = gltf_direction_to_runtime([0.0, 0.0, 1.0]);
+        assert!((normal.length() - 1.0).abs() < 1e-6);
     }
 }

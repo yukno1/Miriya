@@ -3,3 +3,7 @@ name = "mir-build"
 version.workspace = true
 edition.workspace = true
 description = "Miriya build and cook library"
+
+[dependencies]
+mir-asset = { path = "../../crates/mir-asset" }
+anyhow = { workspace = true }

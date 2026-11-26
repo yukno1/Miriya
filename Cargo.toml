@@ -22,3 +22,21 @@ hecs = "0.10"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 criterion = "0.5"
+# M4：资产管线（稳定 ID、容器压缩、导入器、作业池与热重载、工具链）。
+uuid = { version = "1", features = ["v7", "serde"] }
+zstd = { version = "0.13", default-features = false, features = ["arrays"] }
+notify = "6"
+rayon = "1"
+gltf = "1.4"
+image = "0.25"
+symphonia = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+
+# 本机 MSVC 18 的 cl.exe 在 zstd-sys 使用 /Z7 时触发 D8050；
+# 仅对该 C 依赖关闭 profile 调试信息，不影响引擎自身的 debug 构建。
+[profile.dev.package.zstd-sys]
+debug = 0
+
+[profile.release.package.zstd-sys]
+debug = 0
