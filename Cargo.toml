@@ -25,7 +25,7 @@ criterion = "0.5"
 # M4：资产管线（稳定 ID、容器压缩、导入器、作业池与热重载、工具链）。
 uuid = { version = "1", features = ["v7", "serde"] }
 zstd = { version = "0.13", default-features = false, features = ["arrays"] }
-notify = "6"
+notify = "9"
 rayon = "1"
 gltf = "1.4"
 image = "0.25"
