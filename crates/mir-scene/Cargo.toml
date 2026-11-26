@@ -7,3 +7,13 @@ description = "Miriya scene system"
 [dependencies]
 mir-ecs = { path = "../mir-ecs" }
 mir-math = { path = "../mir-math" }
+mir-serialize = { path = "../mir-serialize" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "hierarchy"
+harness = false

@@ -6,3 +6,4 @@ description = "Miriya math library"
 
 [dependencies]
 glam = "0.34.3"
+serde = { workspace = true }

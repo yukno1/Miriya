@@ -28,8 +28,9 @@ impl Default for Camera {
             yaw: 0.0,
             pitch: 0.0,
             fov_y: 60.0_f32.to_radians(),
-            z_near: 0.1,
-            z_far: 1000.0,
+            // ADR-0003 / M3：运行时单位为厘米，近远裁剪面同步校准为 1 cm / 1000 m。
+            z_near: 1.0,
+            z_far: 100_000.0,
         }
     }
 }
@@ -78,8 +79,6 @@ impl Camera {
     }
 }
 
-impl mir_ecs::Component for Camera {}
-
 /// 一帧的相机输入：移动轴 + 鼠标增量 + 加速标志。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CameraInput {
@@ -97,7 +96,7 @@ pub struct CameraInput {
 /// 帧率无关的自由飞行控制器；不依赖窗口或输入 crate，便于 headless 测试。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraController {
-    /// 基础移动速度（单位/秒）。
+    /// 基础移动速度（厘米/秒）。
     pub speed: f32,
     /// 加速倍率。
     pub boost_multiplier: f32,
@@ -108,7 +107,8 @@ pub struct CameraController {
 impl Default for CameraController {
     fn default() -> Self {
         Self {
-            speed: 5.0,
+            // 500 cm/s = 5 m/s，与 v0.2 演示的视觉移动速度一致。
+            speed: 500.0,
             boost_multiplier: 3.0,
             sensitivity: 0.0022,
         }
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn look_at_target_and_clamp_pitch() {
         let mut camera = Camera {
-            position: Vec3::new(-12.0, -10.0, 8.0),
+            position: Vec3::new(-1200.0, -1000.0, 800.0),
             ..Default::default()
         };
         camera.look_at(Vec3::ZERO);
@@ -205,7 +205,7 @@ mod tests {
         controller.update(&mut twice, 0.05, input);
         controller.update(&mut twice, 0.05, input);
 
-        assert!(approx(once.position.x, 0.5));
+        assert!(approx(once.position.x, 50.0));
         assert!(approx(twice.position.x, once.position.x));
     }
 
@@ -222,7 +222,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(approx(camera.position.length(), 1.5));
+        assert!(approx(camera.position.length(), 150.0));
 
         controller.update(
             &mut camera,

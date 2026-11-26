@@ -1,11 +1,15 @@
 //! Miriya 示例应用：展示如何基于 engine crate 搭建游戏。
 
 use miriya_engine::core::{AppState, EngineConfig, EngineContext};
-use miriya_engine::ecs::{Entity, World};
 use miriya_engine::input::{KeyCode, MouseButton};
-use miriya_engine::math::{Aabb, Frustum, Quat, Vec2, Vec3};
+use miriya_engine::math::interop::{
+    meters_to_centimeters as m_to_cm, meters_to_centimeters_vec3 as mvec_to_cm,
+};
+use miriya_engine::math::{Aabb, Frustum, Quat, Transform, Vec2, Vec3};
 use miriya_engine::render::{CameraFrame, InstanceData, MaterialData, MaterialHandle, MeshHandle};
-use miriya_engine::scene::{Camera, CameraController, CameraInput, Transform};
+use miriya_engine::scene::{
+    ActorId, Camera, CameraController, CameraInput, Level, WorldTransforms,
+};
 
 /// 演示物体使用的程序化几何（R-12）。
 #[derive(Debug, Clone, Copy)]
@@ -17,11 +21,11 @@ enum Prop {
 
 /// 游戏状态：实现引擎的 `AppState` trait。
 struct Game {
-    world: World,
-    /// 演示物体：实体 + 几何类型 + 材质下标（`self.materials` 的下标）。
-    props: Vec<(Entity, Prop, usize)>,
-    /// 阵列中心的实体（自转圆环），用于逐帧更新。
-    center: Entity,
+    level: Level,
+    /// 演示物体：Actor + 几何类型 + 材质下标（`self.materials` 的下标）。
+    props: Vec<(ActorId, Prop, usize)>,
+    /// 阵列中心的 Actor（自转圆环），用于逐帧更新。
+    center: ActorId,
     /// 网格句柄（渲染初始化后才能创建，故惰性创建）。
     meshes: Option<(MeshHandle, MeshHandle, MeshHandle)>,
     mesh_failed: bool,
@@ -46,72 +50,81 @@ struct Game {
 
 impl Game {
     fn new(stats_enabled: bool, graph_dump: bool) -> Self {
-        let mut world = World::new();
-        let mut props: Vec<(Entity, Prop, usize)> = Vec::new();
+        let mut level = Level::new("demo");
+        let mut props: Vec<(ActorId, Prop, usize)> = Vec::new();
+        // 根 Actor 保持恒等变换：立方体挂到其下验证层级链路，但不改变 v0.2 画面。
+        let root = level.spawn_actor("root").expect("创建根 Actor 失败");
 
-        // 3×3 阵列（去掉中心位置留给自转圆环）：列向金属度梯度、行向粗糙度梯度，
-        // 肉眼可辨 metallic 0↔1 与 roughness 0↔1 的 PBR 差异（R-12 Gate）。
+        // 3×3 阵列（去掉中心位置留给自转圆环）：列向金属度梯度、行向粗糙度梯度。
+        // M3 起所有世界位置/尺寸以厘米表示；下列字面量仍按米设计，统一经 interop 转换。
         for (row, x) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
             for (column, y) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
                 if row == 1 && column == 1 {
                     continue; // 中心留给圆环
                 }
-                let entity = world.spawn();
-                world.insert(
-                    entity,
-                    Transform {
-                        position: Vec3::new(x, y, 0.0),
-                        scale: Vec3::splat(2.0),
-                        ..Default::default()
-                    },
-                );
-                props.push((entity, Prop::Cube, props.len()));
+                let actor = level
+                    .spawn_actor_with_transform(
+                        format!("cube-{row}-{column}"),
+                        Transform {
+                            position: mvec_to_cm(Vec3::new(x, y, 0.0)),
+                            // 单位网格以厘米解释，缩放倍率按目标尺寸一次性校准。
+                            scale: Vec3::splat(m_to_cm(2.0)),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("创建立方体 Actor 失败");
+                level
+                    .set_parent(actor, root)
+                    .expect("设置立方体父子关系失败");
+                props.push((actor, Prop::Cube, props.len()));
             }
         }
 
         // 阵列中心：自转金属圆环。
-        let center = world.spawn();
-        world.insert(
-            center,
-            Transform {
-                scale: Vec3::splat(1.0),
-                ..Default::default()
-            },
-        );
-        let torus_material = props.len();
-        props.push((center, Prop::Torus, torus_material));
+        let center = level
+            .spawn_actor_with_transform(
+                "center-torus",
+                Transform {
+                    scale: Vec3::splat(m_to_cm(1.0)),
+                    ..Default::default()
+                },
+            )
+            .expect("创建圆环 Actor 失败");
+        props.push((center, Prop::Torus, props.len()));
 
         // 两枚球：粗糙红塑料（左后）与自发光（右前），验证 emissive 与漫反射对照。
-        let plastic_sphere = world.spawn();
-        world.insert(
-            plastic_sphere,
-            Transform {
-                position: Vec3::new(-8.0, 0.0, 0.0),
-                scale: Vec3::splat(1.5),
-                ..Default::default()
-            },
-        );
+        let plastic_sphere = level
+            .spawn_actor_with_transform(
+                "plastic-sphere",
+                Transform {
+                    position: mvec_to_cm(Vec3::new(-8.0, 0.0, 0.0)),
+                    scale: Vec3::splat(m_to_cm(1.5)),
+                    ..Default::default()
+                },
+            )
+            .expect("创建塑料球 Actor 失败");
         props.push((plastic_sphere, Prop::Sphere, props.len()));
 
-        let emissive_sphere = world.spawn();
-        world.insert(
-            emissive_sphere,
-            Transform {
-                position: Vec3::new(0.0, 8.0, 0.0),
-                scale: Vec3::splat(1.2),
-                ..Default::default()
-            },
-        );
+        let emissive_sphere = level
+            .spawn_actor_with_transform(
+                "emissive-sphere",
+                Transform {
+                    position: mvec_to_cm(Vec3::new(0.0, 8.0, 0.0)),
+                    scale: Vec3::splat(m_to_cm(1.2)),
+                    ..Default::default()
+                },
+            )
+            .expect("创建自发光球 Actor 失败");
         props.push((emissive_sphere, Prop::Sphere, props.len()));
 
         let mut camera = Camera {
-            position: Vec3::new(-12.0, -10.0, 8.0),
+            position: mvec_to_cm(Vec3::new(-12.0, -10.0, 8.0)),
             ..Default::default()
         };
         camera.look_at(Vec3::ZERO);
 
         Self {
-            world,
+            level,
             props,
             center,
             meshes: None,
@@ -183,8 +196,8 @@ impl Game {
 impl AppState for Game {
     fn on_start(&mut self, ctx: &mut EngineContext) {
         println!(
-            "游戏启动，实体数：{}，窗口：{}x{}",
-            self.world.entities().len(),
+            "游戏启动，Actor 数：{}，窗口：{}x{}",
+            self.level.actor_count(),
             ctx.renderer.size().0,
             ctx.renderer.size().1
         );
@@ -226,12 +239,14 @@ impl AppState for Game {
             },
         );
 
-        // 中心立方体自转；模型矩阵在 on_render 的 extract 阶段读取。
+        // 中心圆环自转；模型矩阵在 on_render 的 extract 阶段读取。
         let elapsed = ctx.time.elapsed_secs();
-        if let Some(transform) = self.world.get_mut::<Transform>(self.center) {
-            transform.rotation =
-                Quat::from_rotation_z(elapsed * 0.6) * Quat::from_rotation_y(elapsed * 0.4);
-        }
+        self.level
+            .update_transform(self.center, |transform| {
+                transform.rotation =
+                    Quat::from_rotation_z(elapsed * 0.6) * Quat::from_rotation_y(elapsed * 0.4);
+            })
+            .expect("更新圆环 Actor 变换失败");
 
         // Esc 或点击关闭按钮均通过 request_exit 退出
         if ctx.input.just_pressed(KeyCode::Escape) {
@@ -260,6 +275,16 @@ impl AppState for Game {
         }
         self.ensure_materials(ctx);
 
+        // extract 边界：先烘焙层级世界矩阵，渲染层只接收纯数据。
+        let world_transforms = match self.level.world_transforms() {
+            Ok(transforms) => transforms,
+            Err(error) => {
+                eprintln!("层级世界变换失败：{error}");
+                self.last_submitted = 0;
+                WorldTransforms::default()
+            }
+        };
+
         ctx.renderer.begin_frame([0.02, 0.02, 0.04, 1.0]);
 
         let (width, height) = ctx.renderer.size();
@@ -270,12 +295,12 @@ impl AppState for Game {
         });
 
         if let Some((cube_mesh, sphere_mesh, torus_mesh)) = self.meshes {
-            // 视锥剔除（R-13，ADR-0004 决策 6）：extract 侧做包围盒测试后提交，
-            // 渲染层不感知剔除。包围盒忽略旋转（自转圆环用轴对齐保守包围）。
+            // 视锥剔除（R-13，ADR-0004 决策 6）：extract 侧用世界矩阵变换局部 AABB 后测试，
+            // 渲染层不感知层级与剔除；自转圆环因此得到正确的世界空间包围盒。
             let frustum = Frustum::from_view_proj(self.camera.view_projection(aspect));
             let mut submitted = 0_usize;
-            for (entity, prop, material_index) in self.props.iter().copied() {
-                let Some(transform) = self.world.get::<Transform>(entity) else {
+            for (actor, prop, material_index) in self.props.iter().copied() {
+                let Some(world_matrix) = world_transforms.get(actor) else {
                     continue;
                 };
                 let unit_half = match prop {
@@ -284,12 +309,8 @@ impl AppState for Game {
                     // 圆环主半径 1.6 + 管半径 0.55（XY），Z 向厚 0.55。
                     Prop::Torus => Vec3::new(2.15, 2.15, 0.55),
                 };
-                let half_extent = Vec3::new(
-                    transform.scale.x * unit_half.x,
-                    transform.scale.y * unit_half.y,
-                    transform.scale.z * unit_half.z,
-                );
-                let aabb = Aabb::from_center_half_extent(transform.position, half_extent);
+                let local_aabb = Aabb::from_center_half_extent(Vec3::ZERO, unit_half);
+                let aabb = local_aabb.transformed(world_matrix);
                 if !frustum.intersects_aabb(&aabb) {
                     continue;
                 }
@@ -299,7 +320,7 @@ impl AppState for Game {
                     Prop::Torus => torus_mesh,
                 };
                 let instance = InstanceData {
-                    model: transform.to_matrix(),
+                    model: world_matrix,
                     tint: [1.0, 1.0, 1.0, 1.0],
                 };
                 if let Some(&material) = self.materials.get(material_index) {

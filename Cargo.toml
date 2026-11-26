@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/*",
     "tools/*",
+    "tests",
 ]
 # 在根目录直接 `cargo run` / `cargo test` 时默认进入示例包
 default-members = ["crates/miriya-app"]
@@ -16,3 +17,8 @@ miriya-engine = { path = "crates/miriya-engine" }
 thiserror = "2"
 vulkanalia = { version = "0.35", features = ["libloading", "window"] }
 raw-window-handle = "0.6"
+# M3：ECS 内核、场景快照与基准。统一在 workspace 钉版本，子 crate 显式引用。
+hecs = "0.10"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+criterion = "0.5"

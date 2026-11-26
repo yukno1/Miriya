@@ -4,12 +4,34 @@ use crate::quat::Quat;
 use crate::vec::Vec3;
 
 use glam::{Mat3 as GMat3, Mat4 as GMat4};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 macro_rules! impl_mat {
-    ($name:ident, $glam:ident) => {
+    ($name:ident, $glam:ident, $len:expr) => {
         #[derive(Debug, Clone, Copy, PartialEq, Default)]
         #[repr(transparent)]
         pub struct $name(pub(crate) $glam);
+
+        impl Serialize for $name {
+            #[inline]
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                self.to_cols_array().serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            #[inline]
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let values = <[f32; $len]>::deserialize(deserializer)?;
+                Ok(Self($glam::from_cols_array(&values)))
+            }
+        }
 
         impl $name {
             /// 单位矩阵。
@@ -55,8 +77,8 @@ macro_rules! impl_mat {
     };
 }
 
-impl_mat!(Mat3, GMat3);
-impl_mat!(Mat4, GMat4);
+impl_mat!(Mat3, GMat3, 9);
+impl_mat!(Mat4, GMat4, 16);
 
 impl Mat4 {
     /// 平移矩阵。

@@ -8,7 +8,7 @@
 | 项目信息 | 说明 |
 |---|---|
 | 上游基线 | Unreal Engine **5.8.4**（同机目录 `../UnrealEngine`，仅作行为参考） |
-| 当前阶段 | **M2 · v0.2 Cube 已达成**（渲染 v0 剩余工作仍在进行） |
+| 当前阶段 | **M3 · 场景与 ECS 已达成**（下一步 M4 资产管线） |
 | 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
 | 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
 | 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
@@ -465,18 +465,19 @@ Miriya/
 | crate | 现状 | 成熟度 | 下一步（里程碑） |
 |---|---|---|---|
 | `mir-core` | `EngineConfig`（含 `validation`）/主循环、帧率限制、日志初始化 | 🟡 原型 | 拆 `EngineLoop`/`FramePipeline`、插件与退出资源（M2–M3） |
-| `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`、`Aabb`/`Frustum`（六平面提取 + p-vertex 包围盒测试），含测试 | 🟡 原型 | `Transform` 收敛到本 crate、坐标系转换（M0） |
-| `mir-ecs` | `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>`，递增 `Entity` | 🟡 原型 | 换 hecs、查询/调度/变更检测（M3） |
+| `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`、`Transform`、`interop`（厘米/米集中转换）、`Aabb`/`Frustum`（含世界空间 AABB 变换），serde 数组表示，含测试 | ✅ 可用 | M4 补齐 `Ray`/`Plane`/`Color` 与 glTF/物理边界 interop |
+| `mir-ecs` | `hecs` 门面：世代 `Entity`、`Ref`/`Mut` 守卫、回调式查询、类型化 Resource、Added/Changed 变更追踪、`EcsError` | ✅ 可用 | M7 接入 `Schedule` 与并行查询 |
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
 | `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化、自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统（per-material UBO + 世代句柄）、基础 PBR（GGX metallic-roughness + 单方向光）、视锥剔除（extract 侧） | 🟡 原型 | 多光源/纹理/IBL、glTF 资产（M4/M5） |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | `Handle`/`AssetServer` 同步缓存雏形，失败即 panic | 🟡 原型 | 异步加载、注册表、导入器、错误化（M4） |
-| `mir-scene` | `Scene`、`Transform`（含旋转/TRS）、UI 无关的自由相机与控制器 | 🟡 原型 | Level/Actor/层级/组件（M3） |
+| `mir-scene` | `Level`/`ActorId`/`ActorMeta`/`Parent`/`Children`、拓扑序世界矩阵、父子循环检测、稳定 ID 场景快照、自由相机 | ✅ 可用 | M4 接入资产引用；M6 物理组件；M7 游戏框架 |
+| `mir-serialize` | 版本化快照头（magic/version/schema hash）+ postcard 编解码与可诊断错误 | ✅ 可用 | M4 资产容器 `.miasset` 复用版本化头 |
 | `mir-log` | 全局 logger、五级宏、控制台输出、含单元测试，纯 std | ✅ 可用 | `tracing` 桥接、文件/异步 writer（M1） |
 | `mir-physics` | `PhysicsBackend` 契约、世代句柄、`FixedStep`、查询/接触事件/调试数据、`NullPhysicsBackend`、可复用契约测试；无求解器 | 🟡 契约 | 引擎侧胶水与外部后端接入（M6） |
 | `mir-editor-core` | UI 无关的文档/选择/类型化命令与撤销栈/Inspector 字段描述/视口数学/PIE 状态机，headless 测试 | 🟡 契约 | 完整编辑器核心与 UI 后端 spike（M12） |
 
-> 现状细节与已知问题见 §14。除上表 11 个已有内容的子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
+> 现状细节与已知问题见 §14。除上表 12 个已有内容的子 crate 外，其余 crate 目前均为空壳（仅含模块文档）；
 > 仓库不包含任何物理求解器实现。
 
 ---
@@ -611,7 +612,8 @@ Miriya/
 - **全局约定**：厘米、Z-up、左手系、X 前、Y 右（与 UE 一致），在文档与类型注释中固定。
 - 继续使用 glam 的 newtype 封装策略（`#[repr(transparent)]` + `Deref`），补 `Transform`、`Aabb`、`Frustum`、
   `Ray`、`Plane`、`Color` 与 `interop`（Vulkan NDC、外部物理后端坐标约定、glTF Y-up）。
-  `Transform` 是纯数学类型，归 `mir-math` 所有；现有 `mir-scene::Transform` 在 M3 迁移并重导出，保持应用层导入路径稳定。
+  `Transform` 是纯数学类型，归 `mir-math` 所有；M3 已完成迁移，`mir-scene::Transform` 为兼容重导出。
+  `interop` 已提供厘米/米集中转换，`Aabb::transformed` 支撑层级世界空间剔除。
 - 投影矩阵在**相机边界**转换到 Vulkan 约定（深度 0..1、NDC Y 向下）；物理/导入转换只允许在 `interop` 模块出现。
 - 测试覆盖手性、投影、裁剪、四元数插值；`bytemuck::Pod` 供 GPU 零拷贝（后续）。
 - 禁止在业务代码里手写坐标系翻转；发现即视为评审阻塞项。
@@ -627,15 +629,16 @@ Miriya/
 
 ### 9.4 `mir-ecs`：数据层
 
-- 内部采用 `hecs`（成熟、查询快、维护成本低），对外封装 `World`/`Query`/`System` 稳定的 API。
-- 资源（`Resource`）与实体组件分离；`Schedule` 决定系统顺序；变更检测用版本号（Added/Changed）。
+- M3 已以 `hecs` 替换原型：对外提供 `World`、世代 `Entity`、`Ref`/`Mut` 守卫与回调式 `Query`；`System`/并行查询留待 M7。
+- 资源（`Resource`）与实体组件已分离；变更检测用版本号记录 Added/Changed，`Schedule` 决定系统顺序（M7）。
 - Actor 元数据（名称、层级、反射类型）作为组件；纯运行数据（Transform、Renderable、RigidBody）走 ECS。
 - 预留 archetype/并行查询扩展；不追求自研 ECS 的「炫技」特性。
 - 验收：10k 实体 × 3 组件单线程变换更新 < 1 ms（记录基准机）。
 
 ### 9.5 `mir-scene`：关卡与 Actor
 
-- `Level` = ECS World + 元数据 + 单元划分；`Actor` = 实体句柄 + 组件列表 + 层级 + Tick 策略。
+- M3 已落地 `Level` = ECS World + 稳定 Actor 索引 + 父子层级；`Actor` = 实体句柄 + 元数据/父子组件 + 局部变换。
+  世界矩阵按拓扑序烘焙进 extract 帧数据（`mir-render` 不感知层级）。
 - **Actor 是外观而非基类**：不模拟 UE 的继承层级；行为通过组件与 trait 组合，类型用 `enum`/泛型表达。
 - `ActorComponent` 生命周期（BeginPlay/EndPlay/Serialize）显式定义；Tick 可按距离/可见性关闭。
 - 引用用资产 ID（稳定），不用路径；保存/加载走反射序列化；PIE 通过克隆 World，不污染编辑器状态。
@@ -1058,12 +1061,16 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
   `Vertex` 增法线（stride 36）+ `sphere()`/`torus()` 程序化几何；`mir-math::Frustum`/`Aabb`
   extract 侧视锥剔除（背对场景提交 11→0）；演示场景升级为 metallic/roughness 梯度阵列 +
   金属圆环 + 自发光球；release 1080p 600 帧 58.6 FPS、校验层 0 error。
+- [x] **M3（场景与 ECS）**：`Transform`/`interop` 归 `mir-math` 并统一厘米；`mir-ecs` 切换 hecs 门面
+  （世代句柄、Resource、Added/Changed）；`mir-scene` 落地 `Level`/`Actor`/父子层级与拓扑序世界矩阵；
+  `mir-serialize` 落地版本化场景快照；示例迁移到 Actor API 且世界空间 AABB 剔除正确。
+  10k Actor 世界矩阵基准：扁平 0.10 ms / 纵深 0.36 ms；release 1080p 600 帧 58.2 FPS、校验层 0 error；
+  保存→加载→再保存 golden 一致。详见 `docs/plans/m3-scene-ecs.md` §8/§9。
 
 ### 14.2 已知问题（按里程碑优先修复）
 
-1. 27 个空壳 crate 尚未实现；`miriya-engine` 目前只 re-export 既有原型子系统，新模块尚未接入 facade。
-2. ECS 为 `HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>` 原型：无查询/调度/变更检测；`Entity` 是裸 `u64`，
-   无世代标记，后续若回收 ID 会产生悬垂句柄。
+1. 26 个空壳 crate 尚未实现；`miriya-engine` 已 re-export 既有数学/ECS/场景/序列化子系统，其余新模块随后续里程碑接入。
+2. ECS 已由 `hecs` 门面承载：世代 `Entity`、Resource 与 Added/Changed 可用；`Schedule`/并行查询/变更过滤仍待 M7 接入。
 3. `mir-render` 已具备深度、网格、逐实例绘制、校验层、多帧在飞行、RenderGraph v0.5、单 `.spv` 多入口、
    持久化管线缓存、自研显存子分配器、材质系统、基础 PBR 与视锥剔除（M2 批次 A–F 全部完成）；
    多光源/纹理采样/IBL 为 M5，glTF 资产导入为 M4。
@@ -1086,7 +1093,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 cargo check --workspace
 cargo test --workspace
 
-# 运行示例（3×3 立方体 + 中心自转，10 实例；WASD/QE 移动、右键拖动视角、Esc 退出）
+# 运行示例（12 个 Actor / 11 个绘制实例：3×3 立方体 + 中心自转圆环 + 两枚球；WASD/QE 移动、右键拖动视角、Esc 退出）
 # workspace 已设置 default-members，根目录直接 cargo run 即可
 cargo run
 cargo run -- --frames 600 --width 1920 --height 1080
@@ -1095,6 +1102,10 @@ cargo run --release -- --frames 600 --width 1920 --height 1080
 # 无窗口跑帧（CI/headless 验证）；校验层 debug 默认开启，可显式覆盖
 cargo run -- --headless --frames 1000 --no-validation
 cargo run -- --validation --frames 120
+
+# M3 层级基准与场景 golden（跨 crate 集成测试）
+cargo bench -p mir-scene --bench hierarchy
+cargo test -p miriya-integration-tests
 
 # Vulkan 链路探测（M0 PoC，需 Vulkan 1.3 驱动）
 cargo run -p mir-vulkan-probe
@@ -1127,8 +1138,8 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
       自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统与基础 PBR、
       `mir-math::Frustum`/`Aabb` 视锥剔除——批次 A–F 全部完成（2026-11-24）；
       任务清单与验收 Gate 见 `docs/plans/m2-remaining.md` §9/§10。
-- [ ] **M3**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene` 收敛到 `mir-math`
-      并按 ADR-0012 校准演示单位（米 → 厘米）。
+- [x] **M3（场景与 ECS）**：hecs 封装、Actor/Component、层级变换、序列化往返；`Transform` 从 `mir-scene`
+      收敛到 `mir-math`，演示单位按 ADR-0012 校准为厘米。Gate 与验收记录见 `docs/plans/m3-scene-ecs.md`。
 - [ ] **M4–M13**：按 §8.2 依次推进资产管线、光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）；每次里程碑结束同步 §14 与 `docs/plans/`。
 
@@ -1193,5 +1204,5 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 
 ---
 
-> **文档维护**：Miriya 团队 · 最后更新 2026-11-24
+> **文档维护**：Miriya 团队 · 最后更新 2026-11-26
 > 本文件是**规划**，不代表上述能力已经完成；进度以 §14 为准，变更以 ADR 为准。

@@ -25,6 +25,20 @@ impl Aabb {
         }
     }
 
+    /// 用矩阵变换包围盒，并返回包围变换后 8 个角点的世界空间 AABB。
+    ///
+    /// 层级场景下局部 AABB 需先经世界矩阵变换，再交给视锥剔除（M3）。
+    pub fn transformed(&self, matrix: Mat4) -> Self {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for corner in self.corners() {
+            let point = matrix.transform_point(corner);
+            min = min.min(point);
+            max = max.max(point);
+        }
+        Self { min, max }
+    }
+
     /// 包围盒的 8 个角点。
     pub fn corners(&self) -> [Vec3; 8] {
         [
@@ -176,5 +190,24 @@ mod tests {
         assert_eq!(corners.len(), 8);
         assert!(corners.iter().any(|c| *c == Vec3::new(0.0, 1.0, 2.0)));
         assert!(corners.iter().any(|c| *c == Vec3::new(2.0, 3.0, 4.0)));
+    }
+
+    #[test]
+    fn aabb_transformed_covers_rotated_extent() {
+        use crate::{Quat, Transform};
+
+        let local = Aabb::from_center_half_extent(Vec3::ZERO, Vec3::new(1.0, 2.0, 3.0));
+        let world = Transform {
+            position: Vec3::new(100.0, 0.0, 0.0),
+            rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            scale: Vec3::splat(2.0),
+        };
+        let transformed = local.transformed(world.to_matrix());
+        assert!((transformed.min.x - 96.0).abs() < 1e-4);
+        assert!((transformed.max.x - 104.0).abs() < 1e-4);
+        assert!((transformed.min.y + 2.0).abs() < 1e-4);
+        assert!((transformed.max.y - 2.0).abs() < 1e-4);
+        assert!((transformed.min.z + 6.0).abs() < 1e-4);
+        assert!((transformed.max.z - 6.0).abs() < 1e-4);
     }
 }

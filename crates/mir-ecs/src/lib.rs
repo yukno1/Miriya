@@ -1,93 +1,103 @@
-//! 实体组件系统（ECS）。
+//! 实体组件系统（ECS）门面。
 //!
-//! 当前为最小原型：`World` 存储实体与组件，后续可考虑接入
-//! hecs / bevy_ecs 等成熟实现。
+//! M3 起内部使用 `hecs`：对外提供世代实体句柄、稳定查询 API、
+//! 类型化 Resource 与基础变更检测；上层不直接依赖 hecs 类型。
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
+#![forbid(unsafe_code)]
 
-/// 实体标识符。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Entity(u64);
+mod change;
+mod entity;
+mod error;
+mod resource;
+mod world;
 
-/// 组件 trait：所有可挂载到实体上的数据类型。
-pub trait Component: Any + 'static {}
+pub use change::{ChangeKind, ChangeTracker};
+pub use entity::Entity;
+pub use error::{EcsError, Result};
+pub use resource::{Resource, Resources};
+pub use world::{Component, Mut, Ref, World};
 
-/// 组件存储。
-#[derive(Default)]
-struct ComponentStore {
-    data: HashMap<TypeId, HashMap<Entity, Box<dyn Any>>>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 世界：实体与组件的容器。
-#[derive(Default)]
-pub struct World {
-    next_entity: u64,
-    entities: Vec<Entity>,
-    components: ComponentStore,
-}
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Position(f32);
 
-impl World {
-    pub fn new() -> Self {
-        Self::default()
+    #[derive(Debug, PartialEq)]
+    struct Score(u32);
+
+    #[test]
+    fn spawn_query_and_despawn() {
+        let mut world = World::new();
+        let first = world.spawn();
+        let second = world.spawn();
+        assert_eq!(world.len(), 2);
+
+        world.insert(first, Position(1.0)).unwrap();
+        world.insert(second, Position(2.0)).unwrap();
+
+        assert_eq!(
+            world.get::<Position>(first).map(|p| *p),
+            Some(Position(1.0))
+        );
+        let mut queried = Vec::new();
+        world.query::<Position>(|_, position| queried.push(position.0));
+        assert_eq!(queried, vec![1.0, 2.0]);
+
+        world.despawn(first).unwrap();
+        assert!(!world.is_alive(first));
+        assert!(world.get::<Position>(first).is_none());
+        assert!(matches!(
+            world.try_get::<Position>(first),
+            Err(EcsError::NoSuchEntity(_))
+        ));
+        assert!(world.is_alive(second));
     }
 
-    /// 创建新实体。
-    pub fn spawn(&mut self) -> Entity {
-        self.next_entity += 1;
-        let e = Entity(self.next_entity);
-        self.entities.push(e);
-        e
+    #[test]
+    fn stale_handle_does_not_alias_new_entity() {
+        let mut world = World::new();
+        let old = world.spawn();
+        world.insert(old, Position(9.0)).unwrap();
+        world.despawn(old).unwrap();
+        let new = world.spawn();
+        assert_ne!(old, new, "世代句柄必须区分复用索引的新实体");
+        assert!(world.get::<Position>(new).is_none());
     }
 
-    /// 删除实体及其所有组件。
-    pub fn despawn(&mut self, entity: Entity) {
-        self.entities.retain(|e| *e != entity);
-        for store in self.components.data.values_mut() {
-            store.remove(&entity);
+    #[test]
+    fn mutable_access_reports_changes() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        let before = world.change_tick();
+
+        world.insert(entity, Position(1.0)).unwrap();
+        let added: Vec<_> = world.changes_since::<Position>(before).collect();
+        assert_eq!(added, vec![(entity, ChangeKind::Added)]);
+
+        let since_added = world.change_tick();
+        {
+            let mut position = world.get_mut::<Position>(entity).unwrap();
+            position.0 = 3.0;
         }
+        let changed: Vec<_> = world.changes_since::<Position>(since_added).collect();
+        assert_eq!(changed.len(), 1);
+        assert!(matches!(changed[0].1, ChangeKind::Changed(_)));
+        assert_eq!(
+            world.get::<Position>(entity).map(|p| *p),
+            Some(Position(3.0))
+        );
     }
 
-    pub fn entities(&self) -> &[Entity] {
-        &self.entities
-    }
-
-    /// 为实体挂载组件。
-    pub fn insert<C: Component>(&mut self, entity: Entity, component: C) {
-        self.components
-            .data
-            .entry(TypeId::of::<C>())
-            .or_default()
-            .insert(entity, Box::new(component));
-    }
-
-    /// 读取实体的组件。
-    pub fn get<C: Component>(&self, entity: Entity) -> Option<&C> {
-        self.components
-            .data
-            .get(&TypeId::of::<C>())?
-            .get(&entity)?
-            .downcast_ref::<C>()
-    }
-
-    /// 可变读取实体的组件。
-    pub fn get_mut<C: Component>(&mut self, entity: Entity) -> Option<&mut C> {
-        self.components
-            .data
-            .get_mut(&TypeId::of::<C>())?
-            .get_mut(&entity)?
-            .downcast_mut::<C>()
-    }
-
-    /// 遍历拥有指定组件类型 `C` 的所有实体。
-    pub fn query<C: Component>(&self) -> impl Iterator<Item = (Entity, &C)> {
-        self.components
-            .data
-            .get(&TypeId::of::<C>())
-            .into_iter()
-            .flat_map(|store| store.iter())
-            .filter_map(|(e, c)| c.downcast_ref::<C>().map(|c| (*e, c)))
+    #[test]
+    fn typed_resources_are_separate_from_components() {
+        let mut world = World::new();
+        assert!(world.get_resource::<Score>().is_none());
+        assert!(world.insert_resource(Score(7)).is_none());
+        assert_eq!(world.get_resource::<Score>(), Some(&Score(7)));
+        world.get_resource_mut::<Score>().unwrap().0 = 11;
+        assert_eq!(world.remove_resource::<Score>(), Some(Score(11)));
+        assert!(world.get_resource::<Score>().is_none());
     }
 }
-
-impl Component for mir_math::Vec3 {}

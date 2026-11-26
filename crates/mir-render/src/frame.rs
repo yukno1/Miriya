@@ -13,7 +13,7 @@ use crate::{MaterialHandle, MeshHandle};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraFrame {
     pub view_proj: Mat4,
-    /// 相机世界坐标（米/单位与场景一致）。
+    /// 相机世界坐标，单位厘米（ADR-0003；渲染层只做纯数据传递）。
     pub camera_position: [f32; 3],
 }
 

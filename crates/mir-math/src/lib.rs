@@ -5,11 +5,15 @@
 //! 受控的公共 API，后续可平滑替换底层实现。
 
 pub mod frustum;
+pub mod interop;
 pub mod mat;
 pub mod quat;
+pub mod transform;
 pub mod vec;
 
 pub use frustum::{Aabb, Frustum};
+pub use interop::*;
 pub use mat::{Mat3, Mat4};
 pub use quat::Quat;
+pub use transform::Transform;
 pub use vec::{Vec2, Vec3, Vec4};

@@ -3,3 +3,8 @@ name = "mir-serialize"
 version.workspace = true
 edition.workspace = true
 description = "Miriya versioned serialization"
+
+[dependencies]
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

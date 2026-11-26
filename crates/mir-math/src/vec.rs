@@ -5,12 +5,34 @@
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
 use glam::{Vec2 as GVec2, Vec3 as GVec3, Vec4 as GVec4};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 macro_rules! impl_vec {
-    ($name:ident, $glam:ident, [ $($axis:ident),+ ]) => {
+    ($name:ident, $glam:ident, $len:expr, [ $($axis:ident),+ ]) => {
         #[derive(Debug, Clone, Copy, PartialEq, Default)]
         #[repr(transparent)]
         pub struct $name(pub(crate) $glam);
+
+        impl Serialize for $name {
+            #[inline]
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                self.to_array().serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            #[inline]
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let values = <[f32; $len]>::deserialize(deserializer)?;
+                Ok(Self($glam::from_array(values)))
+            }
+        }
 
         impl $name {
             pub const ZERO: Self = Self($glam::ZERO);
@@ -165,9 +187,9 @@ macro_rules! impl_vec {
     };
 }
 
-impl_vec!(Vec2, GVec2, [X, Y]);
-impl_vec!(Vec3, GVec3, [X, Y, Z]);
-impl_vec!(Vec4, GVec4, [X, Y, Z, W]);
+impl_vec!(Vec2, GVec2, 2, [X, Y]);
+impl_vec!(Vec3, GVec3, 3, [X, Y, Z]);
+impl_vec!(Vec4, GVec4, 4, [X, Y, Z, W]);
 
 impl Vec2 {
     /// 由 `Vec2` 与 z 分量构造 `Vec3`。

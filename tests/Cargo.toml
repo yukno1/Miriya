@@ -1,0 +1,17 @@
+[package]
+name = "miriya-integration-tests"
+version.workspace = true
+edition.workspace = true
+description = "Cross-crate Miriya integration and golden tests"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "scene_roundtrip"
+path = "scene_roundtrip.rs"
+
+[dev-dependencies]
+mir-math = { path = "../crates/mir-math" }
+mir-scene = { path = "../crates/mir-scene" }
+mir-serialize = { path = "../crates/mir-serialize" }

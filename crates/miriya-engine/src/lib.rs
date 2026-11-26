@@ -28,3 +28,5 @@ pub use mir_scene as scene;
 pub use mir_window as window;
 
 pub use mir_core::{Engine, EngineConfig};
+/// M3：`Transform` 与单位转换集中在 `mir-math`，门面同时提供根级便捷入口。
+pub use mir_math::{Transform, interop};

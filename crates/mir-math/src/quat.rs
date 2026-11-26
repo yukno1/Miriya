@@ -1,10 +1,33 @@
 //! 四元数：对 `glam::Quat` 的 newtype 封装。
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::vec::Vec3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[repr(transparent)]
 pub struct Quat(pub(crate) glam::Quat);
+
+impl Serialize for Quat {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_array().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Quat {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let [x, y, z, w] = <[f32; 4]>::deserialize(deserializer)?;
+        Ok(Self::from_xyzw(x, y, z, w))
+    }
+}
 
 impl Quat {
     /// 单位四元数（不旋转）。

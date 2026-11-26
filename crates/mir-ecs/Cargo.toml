@@ -5,4 +5,5 @@ edition.workspace = true
 description = "Miriya entity component system"
 
 [dependencies]
-mir-math = { path = "../mir-math" }
+hecs = { workspace = true }
+thiserror = { workspace = true }
