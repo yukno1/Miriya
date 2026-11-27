@@ -1,11 +1,11 @@
-//! PNG 解码与 KTX2 元信息解析（M4）。
+//! PNG 解码与 KTX2 解析（M4 元信息 / M5 批次 A 层级元数据）。
 //!
-//! 只产出 CPU 侧纯数据；GPU 纹理创建留待 M5。
+//! 只产出 CPU 侧纯数据；GPU 纹理创建由 `mir-render` 完成（应用层负责转换为 `TextureData`）。
 
 mod ktx2;
 mod png;
 
-pub use ktx2::{Ktx2Data, parse_ktx2};
+pub use ktx2::{Ktx2Data, Ktx2Mip, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, parse_ktx2};
 pub use png::decode_png;
 
 use thiserror::Error;

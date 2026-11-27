@@ -1,8 +1,8 @@
 //! RenderGraph 声明、DOT dump、barrier 翻译与 GPU pass 计时回读（R-03/R-04/R-05）。
 
+use vulkanalia::Device;
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::vk::DeviceV1_3;
-use vulkanalia::Device;
 
 use crate::frame::DrawInstance;
 use crate::graph;

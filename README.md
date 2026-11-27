@@ -8,7 +8,7 @@
 | 项目信息 | 说明 |
 |---|---|
 | 上游基线 | Unreal Engine **5.8.4**（同机目录 `../UnrealEngine`，仅作行为参考） |
-| 当前阶段 | **M4 · 资产管线已达成**（下一步 M5 材质与光照） |
+| 当前阶段 | **M4 · 资产管线已达成**（M5 材质与光照计划已落盘 `docs/plans/m5-material-lighting.md`，批次 A–G 待执行） |
 | 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
 | 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
 | 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
@@ -1078,8 +1078,10 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 2. ECS 已由 `hecs` 门面承载：世代 `Entity`、Resource 与 Added/Changed 可用；`Schedule`/并行查询/变更过滤仍待 M7 接入。
 3. `mir-render` 已具备深度、网格、逐实例绘制、校验层、多帧在飞行、RenderGraph v0.5、单 `.spv` 多入口、
    持久化管线缓存、自研显存子分配器、材质系统、基础 PBR 与视锥剔除（M2 批次 A–F 全部完成）；
-   多光源/纹理采样/IBL 为 M5；GLB 网格/PBR 参数导入已在 M4 落地，但纹理绑定仍需 M5。
-4. `mir-asset` 已完成错误化、异步加载与热重载；纹理 GPU 上传/采样仍待 M5，FLAC/FBX 导入留待后续。
+   多光源/纹理采样/IBL 为 M5；GLB 网格/PBR 参数导入已在 M4 落地，但纹理绑定仍需 M5
+   （批次划分见 `docs/plans/m5-material-lighting.md`）。
+4. `mir-asset` 已完成错误化、异步加载与热重载；纹理 GPU 上传/采样仍待 M5
+   （KTX2 mip 元数据解析与 `create_texture` 在 M5 批次 A 落地），FLAC/FBX 导入留待后续。
 5. Git 仓库已初始化且已推送到 `origin/main`；本地工作区需随每次里程碑同步提交。
 6. DPI 缩放尚未处理；窗口尺寸仅以物理像素记录，未适配高 DPI 显示器。
 7. `vulkanalia` 已接入 `mir-render` 且校验层可用；.NET 11 宿主仍未接入；

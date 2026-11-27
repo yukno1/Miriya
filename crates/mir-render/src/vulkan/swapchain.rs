@@ -8,7 +8,11 @@ use crate::RenderInitError;
 use super::VulkanCore;
 
 impl VulkanCore {
-    pub(super) fn create_swapchain(&mut self, width: u32, height: u32) -> Result<(), RenderInitError> {
+    pub(super) fn create_swapchain(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderInitError> {
         let surface = self.surface.ok_or(RenderInitError::NoDevice)?;
         let format = self.format_value.ok_or(RenderInitError::NoDevice)?;
         let mode = self.mode_value.ok_or(RenderInitError::NoDevice)?;

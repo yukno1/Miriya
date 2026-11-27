@@ -15,12 +15,14 @@ mod geometry;
 mod graph;
 mod material;
 mod mesh;
+mod texture;
 mod vulkan;
 
 pub use frame::{CameraFrame, InstanceData};
 pub use geometry::{cube, sphere, torus};
 pub use material::{MaterialData, MaterialHandle};
 pub use mesh::{MeshData, MeshHandle, Vertex};
+pub use texture::{ImageFormat, MipRange, TextureData, TextureDataError, TextureHandle};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
@@ -56,6 +58,8 @@ pub enum RenderInitError {
     Mesh(String),
     #[error("Vulkan material creation failed: {0}")]
     Material(String),
+    #[error("Vulkan texture creation failed: {0}")]
+    Texture(String),
     #[error("renderer is not initialized")]
     NotInitialized,
     #[error("renderer is already initialized")]
@@ -344,6 +348,27 @@ impl RenderContext {
         }
     }
 
+    /// 创建 GPU 纹理（M5 批次 A）：mip 链图像 + 视图 + 采样器 + staging 上传。
+    ///
+    /// headless 下同样可创建（设备与分配器可用，只是不会被绘制引用）。
+    /// 纹理槽位上限 128（`MAX_TEXTURES`），超限返回 `Texture` 错误。
+    pub fn create_texture(&mut self, data: &TextureData) -> Result<TextureHandle, RenderInitError> {
+        let backend = self
+            .backend
+            .as_mut()
+            .ok_or(RenderInitError::NotInitialized)?;
+        backend
+            .create_texture(data)
+            .map_err(RenderInitError::Texture)
+    }
+
+    /// 销毁纹理；句柄无效或已销毁时为空操作（对齐 `destroy_mesh` 语义）。
+    pub fn destroy_texture(&mut self, handle: TextureHandle) {
+        if let Some(backend) = self.backend.as_mut() {
+            let _ = backend.destroy_texture(handle);
+        }
+    }
+
     /// 完成本帧：清屏 → 提交 → 呈现。headless 或窗口最小化时为空操作。
     pub fn end_frame(&mut self) {
         debug_assert!(self.initialized);
@@ -465,6 +490,114 @@ mod tests {
             context.create_mesh(&MeshData::default()),
             Err(RenderInitError::Mesh(_))
         ));
+    }
+
+    #[test]
+    fn create_texture_requires_initialized_renderer() {
+        let mut context = RenderContext::new(320, 200);
+        let data = TextureData::from_rgba8(4, 4, vec![0u8; 64]).expect("纹理数据");
+        let error = context.create_texture(&data).unwrap_err();
+        assert_eq!(error, RenderInitError::NotInitialized);
+    }
+
+    #[test]
+    fn headless_texture_upload_roundtrip_when_vulkan_available() {
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+
+        // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let baseline = context.allocated_bytes();
+        let texture = context
+            .create_texture(&test_texture(64, 64))
+            .expect("上传多 mip 纹理");
+        context.destroy_texture(texture);
+        // 旧句柄重复销毁不应 panic（世代号不匹配即忽略）。
+        context.destroy_texture(texture);
+
+        // 槽位复用后世代号应变化，新旧句柄不相等。
+        let reused = context
+            .create_texture(&test_texture(4, 4))
+            .expect("复用槽位上传纹理");
+        assert_ne!(texture, reused);
+        context.destroy_texture(reused);
+
+        // 上传完成后分配器应无残留（M5 批次 A 泄漏守恒）。
+        assert_eq!(context.allocated_bytes(), baseline);
+    }
+
+    /// 带校验层的纹理上传专项验证（R-03）：默认 ignored，CI 手动触发
+    /// `cargo test -p mir-render texture_upload_validation -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "需要 Vulkan 校验层环境，手动触发"]
+    fn texture_upload_validation_layer_when_vulkan_available() {
+        let mut context = RenderContext::new(320, 240).with_validation(true);
+        context.init();
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let baseline = context.allocated_bytes();
+        for size in [64, 33, 1] {
+            let texture = context
+                .create_texture(&test_texture(size, size))
+                .expect("校验层纹理上传");
+            context.destroy_texture(texture);
+        }
+        // 分配器守恒：全部销毁后无残留。
+        assert_eq!(context.allocated_bytes(), baseline);
+    }
+
+    #[test]
+    fn headless_texture_create_destroy_stress_when_vulkan_available() {
+        let mut context = RenderContext::new(320, 240);
+        context.init();
+
+        // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
+        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+            return;
+        }
+
+        let data = test_texture(32, 32);
+        // 上传前基线（headless 初始化本身会占用相机 UBO 等分配）。
+        let baseline = context.allocated_bytes();
+        for _ in 0..1000 {
+            let handle = context.create_texture(&data).expect("压力循环创建纹理");
+            // 门面销毁与 destroy_mesh 语义一致：句柄无效时为空操作。
+            context.destroy_texture(handle);
+        }
+        assert_eq!(
+            context.allocated_bytes(),
+            baseline,
+            "1000 次创建/销毁后无显存残留"
+        );
+    }
+
+    /// 构造完整 mip 链的测试纹理（RGBA8，各层填充递增字节）。
+    fn test_texture(width: u32, height: u32) -> TextureData {
+        let mut bytes = Vec::new();
+        let mut mips = Vec::new();
+        let mut level = 0;
+        loop {
+            let w = crate::texture::mip_dimension(width, level);
+            let h = crate::texture::mip_dimension(height, level);
+            let size = (w * h * 4) as usize;
+            let offset = bytes.len();
+            bytes.extend(std::iter::repeat_n(level as u8 + 1, size));
+            mips.push(MipRange {
+                offset,
+                length: size,
+            });
+            if w == 1 && h == 1 {
+                break;
+            }
+            level += 1;
+        }
+        TextureData::new(ImageFormat::R8G8B8A8Unorm, width, height, mips, bytes)
+            .expect("测试纹理数据合法")
     }
 
     #[test]

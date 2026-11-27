@@ -22,6 +22,16 @@ pub(super) struct DeletionEntry {
     /// 材质描述符集（R-11）：同 fence 信号后归还描述符池
     /// （池创建时带 FREE_DESCRIPTOR_SET_BIT）。
     pub(super) descriptor_sets: Vec<vk::DescriptorSet>,
+    /// 图像资源（M5 批次 A）：image + 显存 + 视图 + 采样器，同 fence 信号后销毁。
+    pub(super) images: Vec<DeletionImage>,
+}
+
+/// 待延迟销毁的完整 GPU 图像资源（M5 批次 A）。
+pub(super) struct DeletionImage {
+    pub(super) image: vk::Image,
+    pub(super) allocation: Allocation,
+    pub(super) view: vk::ImageView,
+    pub(super) sampler: vk::Sampler,
 }
 
 impl VulkanCore {
@@ -218,6 +228,16 @@ impl VulkanCore {
                     // SAFETY: 关联 fence 已信号，GPU 侧不再使用该缓冲。
                     unsafe { self.device.destroy_buffer(buffer, None) };
                     self.allocator.free(&allocation);
+                }
+                for image in entry.images {
+                    // SAFETY: 关联 fence 已信号，GPU 侧不再使用该图像；
+                    // sampler/view/image 由本设备创建，显存归分配器回收。
+                    unsafe {
+                        self.device.destroy_sampler(image.sampler, None);
+                        self.device.destroy_image_view(image.view, None);
+                        self.device.destroy_image(image.image, None);
+                    }
+                    self.allocator.free(&image.allocation);
                 }
                 // 材质描述符集（R-11）：GPU 已不再引用，归还描述符池复用。
                 // 池在 destroy_pipeline 中先于本调用（Drop 顺序：flush_deletions 在前）。

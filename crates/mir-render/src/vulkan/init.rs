@@ -3,11 +3,11 @@
 use std::ffi::{CStr, c_char};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use vulkanalia::Entry;
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::vk::{InstanceV1_1, KhrSurfaceExtensionInstanceCommands};
 use vulkanalia::window as vulkan_window;
-use vulkanalia::Entry;
 
 use crate::RenderInitError;
 use crate::allocator::MemoryAllocator;
@@ -311,6 +311,8 @@ impl VulkanCore {
             free_meshes: Vec::new(),
             materials: Vec::new(),
             free_materials: Vec::new(),
+            textures: Vec::new(),
+            free_textures: Vec::new(),
             default_material: None,
             deletions: Vec::new(),
             allocator,

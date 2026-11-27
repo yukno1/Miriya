@@ -184,6 +184,7 @@ impl VulkanCore {
                     fence,
                     buffers: vec![(material.buffer, material.allocation)],
                     descriptor_sets: vec![material.descriptor_set],
+                    images: Vec::new(),
                 });
             }
         }

@@ -10,6 +10,7 @@
 //! - [`buffer`]：GPU 缓冲分配、staging 上传与延迟销毁队列；
 //! - [`mesh`]：网格资源与世代槽位；
 //! - [`material`]：材质资源与世代槽位；
+//! - [`texture`]：纹理资源（图像 + 视图 + 采样器 + staging 上传，M5 批次 A）；
 //! - [`pipeline`]：图形管线与描述符布局；
 //! - [`pipeline_cache`]：管线缓存与磁盘持久化（R-07）；
 //! - [`frame_graph`]：RenderGraph 声明、dump 与 barrier 翻译；
@@ -38,6 +39,7 @@ mod pipeline;
 mod pipeline_cache;
 mod render;
 mod swapchain;
+mod texture;
 
 use buffer::DeletionEntry;
 use depth::DepthResources;
@@ -45,6 +47,7 @@ use frame::FrameResources;
 use material::{GpuMaterial, MaterialSlot};
 use mesh::MeshSlot;
 use pipeline::PipelineResources;
+use texture::TextureSlot;
 
 /// Vulkan 核心对象。按 frame → pipeline → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
@@ -81,6 +84,9 @@ pub(super) struct VulkanCore {
     /// 材质槽位表（R-11）与空闲槽位（复用时世代号递增）。
     materials: Vec<MaterialSlot>,
     free_materials: Vec<u32>,
+    /// 纹理槽位表（M5 批次 A）与空闲槽位（复用时世代号递增）。
+    textures: Vec<TextureSlot>,
+    free_textures: Vec<u32>,
     /// 默认材质（白色 Lambert）：随 `init_pipeline` 创建，绘制路径在材质句柄
     /// 无效/未提供时回退到它。
     default_material: Option<GpuMaterial>,
@@ -213,6 +219,8 @@ impl Drop for VulkanCore {
             self.destroy_all_meshes();
             // 存活材质的缓冲在 device 销毁前释放（描述符集随上面的池销毁，R-11）。
             self.destroy_all_materials();
+            // 存活纹理在 device 销毁前释放（M5 批次 A）。
+            self.destroy_all_textures();
             self.device.destroy_command_pool(self.transfer_pool, None);
             for view in self.image_views.drain(..) {
                 self.device.destroy_image_view(view, None);

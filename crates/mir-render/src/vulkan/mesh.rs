@@ -78,6 +78,7 @@ impl VulkanCore {
                         (mesh.index_buffer, mesh.index_allocation),
                     ],
                     descriptor_sets: Vec::new(),
+                    images: Vec::new(),
                 });
             }
         }

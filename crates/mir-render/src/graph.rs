@@ -18,9 +18,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::fmt;
 
 use thiserror::Error;
+
+use crate::texture::ImageFormat;
 
 /// pass 在图中的句柄（下标即声明顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,26 +30,6 @@ pub(crate) struct PassId(pub(crate) usize);
 /// 资源在图中的句柄（下标即声明顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourceId(pub(crate) usize);
-
-/// 图像格式（纯数据枚举，仅覆盖 v0.5 实际用到的情形）。
-///
-/// 仅由 transient 声明与单测使用；实际接入 transient 资源在后续批次（别名池）。
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageFormat {
-    R8G8B8A8Unorm,
-    D32Sfloat,
-}
-
-impl fmt::Display for ImageFormat {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::R8G8B8A8Unorm => "R8G8B8A8_UNORM",
-            Self::D32Sfloat => "D32_SFLOAT",
-        };
-        formatter.write_str(name)
-    }
-}
 
 /// 图像布局（编译器追踪的最小集合）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
