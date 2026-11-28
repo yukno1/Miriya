@@ -39,6 +39,20 @@ impl WgpuCore {
         let compiled = frame_graph
             .compile()
             .map_err(|error| format!("RenderGraph 编译失败：{error}"))?;
+        let pass_count = compiled.pass_order.len();
+        let timing_enabled = self
+            .timing
+            .as_ref()
+            .is_some_and(|timing| timing.can_time(pass_count));
+        if let Some(timing) = self.timing.as_mut() {
+            timing.set_pass_names(
+                compiled
+                    .pass_order
+                    .iter()
+                    .map(|id| frame_graph.passes()[id.0].name.clone())
+                    .collect(),
+            );
+        }
         if self.graph_dump {
             self.write_graph_dump(&frame_graph, &compiled);
         }
@@ -61,6 +75,13 @@ impl WgpuCore {
             | CurrentSurfaceTexture::Lost
             | CurrentSurfaceTexture::Validation => return Ok(()),
         };
+
+        // 非阻塞驱动上一帧的映射回调；未就绪的槽位保持 Pending，下一帧跳过采样。
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        if let Some(timing) = self.timing.as_mut() {
+            timing.poll_results(&device);
+        }
 
         self.write_camera(camera);
         let view = surface_texture
@@ -90,8 +111,15 @@ impl WgpuCore {
                 label: Some("wgpu frame encoder"),
             });
 
-        for pass_id in &compiled.pass_order {
+        for (position, pass_id) in compiled.pass_order.iter().enumerate() {
             let pass_desc = &frame_graph.passes()[pass_id.0];
+            let timestamp_writes = if timing_enabled {
+                self.timing
+                    .as_ref()
+                    .and_then(|timing| timing.timestamp_writes(position))
+            } else {
+                None
+            };
             match &pass_desc.kind {
                 graph::PassKind::Graphics { .. } => {
                     let color = RenderPassColorAttachment {
@@ -115,7 +143,7 @@ impl WgpuCore {
                         label: Some("main_geometry"),
                         color_attachments: &[Some(color)],
                         depth_stencil_attachment: Some(depth),
-                        timestamp_writes: None,
+                        timestamp_writes,
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
@@ -152,8 +180,12 @@ impl WgpuCore {
             }
         }
 
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(surface_texture);
+        if let Some(timing) = self.timing.as_mut() {
+            timing.finish_and_submit(encoder, &queue, pass_count, timing_enabled);
+        } else {
+            queue.submit([encoder.finish()]);
+        }
+        queue.present(surface_texture);
         self.frame_index = (self.frame_index + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }

@@ -12,6 +12,7 @@ use crate::frame::PUSH_CONSTANT_SIZE;
 use crate::resource_table::SlotTable;
 
 use super::WgpuCore;
+use super::timing::TimestampCapture;
 
 impl WgpuCore {
     /// headless：无 surface、无交换链，但仍创建设备与管线以支持离线资源上传。
@@ -70,9 +71,16 @@ impl WgpuCore {
                 "适配器不支持 IMMEDIATES（对应 Vulkan push constants）".to_string(),
             ));
         }
+        // 时间戳是可选特性：缺失时只降级 `--stats`，不得让整个 wgpu 后端初始化失败。
+        let timestamps_supported = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let required_features = if timestamps_supported {
+            Features::IMMEDIATES | Features::TIMESTAMP_QUERY
+        } else {
+            Features::IMMEDIATES
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: None,
-            required_features: Features::IMMEDIATES,
+            required_features,
             required_limits: Limits {
                 max_immediate_size: PUSH_CONSTANT_SIZE,
                 ..Limits::default()
@@ -82,6 +90,19 @@ impl WgpuCore {
             trace: Trace::Off,
         }))
         .map_err(|error| RenderInitError::Wgpu(format!("创建设备失败：{error}")))?;
+
+        let timestamp_period = queue.get_timestamp_period();
+        let timing = if timestamps_supported && timestamp_period > 0.0 {
+            mir_log::info!(target: "wgpu", "GPU pass 时间戳已启用（period {timestamp_period:.3}）");
+            Some(TimestampCapture::new(&device, timestamp_period))
+        } else {
+            mir_log::info!(
+                target: "wgpu",
+                "适配器不支持时间戳查询或 period 无效；--stats 无 GPU pass 数据"
+            );
+            None
+        };
+        let timing_bytes = timing.as_ref().map_or(0, TimestampCapture::allocated_bytes);
 
         let info = adapter.get_info();
         let adapter_name = info.name;
@@ -104,6 +125,7 @@ impl WgpuCore {
             textures: SlotTable::new(),
             default_material: None,
             allocated: 0,
+            timing,
             graph_dump: false,
             dump_warned: false,
             adapter_name,
@@ -112,6 +134,7 @@ impl WgpuCore {
             present_mode: None,
             swapchain_image_count: 0,
         };
+        core.track_alloc(timing_bytes);
         core.init_pipeline().map_err(RenderInitError::Wgpu)?;
         core.init_frame_resources().map_err(RenderInitError::Wgpu)?;
         Ok(core)

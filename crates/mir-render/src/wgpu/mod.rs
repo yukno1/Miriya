@@ -9,6 +9,7 @@ mod pipeline;
 mod render;
 mod resources;
 mod surface;
+mod timing;
 
 use wgpu::{Adapter, Device, Instance, Queue, Surface, SurfaceConfiguration, Texture, TextureView};
 
@@ -17,6 +18,7 @@ use crate::resource_table::SlotTable;
 use frame::CameraFrameResources;
 use pipeline::PipelineResources;
 use resources::{GpuMaterial, GpuMesh, GpuTexture};
+use timing::TimestampCapture;
 
 /// wgpu 核心对象；`Instance` 必须比 `Surface` / `Device` 活得更久。
 pub(crate) struct WgpuCore {
@@ -38,8 +40,10 @@ pub(crate) struct WgpuCore {
     pub(crate) materials: SlotTable<GpuMaterial>,
     pub(crate) textures: SlotTable<GpuTexture>,
     pub(crate) default_material: Option<GpuMaterial>,
-    /// 渲染器主动请求的字节数（buffer/texture/UBO）；不等于驱动实际分配量。
+    /// 渲染器主动请求的字节数（buffer/texture/UBO/诊断缓冲）；不等于驱动实际分配量。
     pub(crate) allocated: u64,
+    /// 设备支持时间戳且 period 有效时才存在。
+    pub(crate) timing: Option<TimestampCapture>,
     pub(crate) graph_dump: bool,
     pub(crate) dump_warned: bool,
     pub(crate) adapter_name: String,
@@ -78,9 +82,11 @@ impl WgpuCore {
         self.graph_dump = enabled;
     }
 
-    /// wgpu 首期不暴露 GPU pass 时间戳；未来可基于 `Features::TIMESTAMP_QUERY` 扩展。
+    /// 上一帧各 GPU pass 的耗时（毫秒）；不支持/未采集到时间戳时为空。
     pub(crate) fn last_pass_timings(&self) -> &[(String, f32)] {
-        &[]
+        self.timing
+            .as_ref()
+            .map_or(&[], TimestampCapture::last_pass_timings)
     }
 
     pub(crate) fn allocated_bytes(&self) -> u64 {

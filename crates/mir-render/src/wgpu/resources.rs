@@ -246,6 +246,9 @@ impl Drop for WgpuCore {
             self.track_free(self.depth_bytes);
             self.depth_bytes = 0;
         }
+        if let Some(timing) = &self.timing {
+            self.track_free(timing.allocated_bytes());
+        }
     }
 }
 

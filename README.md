@@ -470,7 +470,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`、`Transform`、`interop`（厘米/米集中转换）、`Aabb`/`Frustum`（含世界空间 AABB 变换），serde 数组表示，含测试 | ✅ 可用 | M4 补齐 `Ray`/`Plane`/`Color` 与 glTF/物理边界 interop |
 | `mir-ecs` | `hecs` 门面：世代 `Entity`、`Ref`/`Mut` 守卫、回调式查询、类型化 Resource、Added/Changed 变更追踪、`EcsError` | ✅ 可用 | M7 接入 `Schedule` 与并行查询 |
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
-| `mir-render` | 双后端（`wgpu` 默认优先、`vulkanalia` Vulkan 1.3 回退），公共 API 统一；交换链/深度/网格/材质/纹理上传、单 `.spv` 多入口、基础 PBR、RenderGraph（Vulkan 自动 barrier/别名/GPU 时间戳/dump；wgpu 复用 pass 序与 dump）、2 帧在飞行、Vulkan 管线缓存与自研显存子分配器、世代句柄、extract 侧视锥剔除 | 🟡 原型 | wgpu GPU 时间戳、多光源/纹理绑定/IBL、glTF 资产 |
+| `mir-render` | 双后端（`wgpu` 默认优先、`vulkanalia` Vulkan 1.3 回退），公共 API 统一；交换链/深度/网格/材质/纹理上传、单 `.spv` 多入口、基础 PBR、RenderGraph（Vulkan 自动 barrier/别名/dump；wgpu 复用 pass 序与 dump）、两后端 GPU pass 时间戳、2 帧在飞行、Vulkan 管线缓存与自研显存子分配器、世代句柄、extract 侧视锥剔除 | 🟡 原型 | 多光源/纹理绑定/IBL、glTF 资产 |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | UUIDv7 `AssetId`、类型化句柄、注册表/依赖图/缓存分离、rayon 异步加载、`.miasset` 分块 zstd 容器、glTF/PNG/KTX2/WAV/OGG 导入、notify 热重载与可诊断错误 | ✅ 可用 | M5 纹理 GPU 上传；M13 接入 cook/pack |
 | `mir-image` | PNG → RGBA8、KTX2 头解析与透传、图像数据错误化 | ✅ 可用 | M5 纹理采样/压缩格式支持 |
@@ -660,7 +660,8 @@ Miriya/
 - **帧结构**：2–3 帧在飞行、环形暂存缓冲、**自研显存子分配器**（块/池/延迟回收，基于 `vulkanalia` 的显存类型，
   不引入 ash）；交换链重建/设备丢失有恢复路径。
 - **管线**：Clustered Forward+：CSM 阴影 → 深度预通道 → 不透明（PBR + IBL）→ 透明 → SSAO/Bloom/色调映射 → UI。
-- **RenderGraph**：pass 声明读写、自动 barrier/layout 转换、临时纹理别名、GPU 时间戳；每帧可 dump 依赖图。
+- **RenderGraph**：pass 声明读写、自动 barrier/layout 转换与临时纹理别名（Vulkan）；wgpu 自带状态跟踪，
+  只消费 pass 序；两后端均支持 GPU pass 时间戳（适配器支持时）与每帧依赖图 dump。
 - **着色器**：Slang（公共 module + `import`）经 `slangc -fvk-use-entrypoint-name` 编译为单个 SPIR-V，
   保留 `vertexMain`/`fragmentMain` 入口名，Rust 侧单 ShaderModule 按入口名绑定；`spirv-reflect` 生成绑定；
   `spirv-val` 与校验层把关；离线缓存以管线哈希为键；开发模式热重载；材质参数走 UBO/SSBO。
