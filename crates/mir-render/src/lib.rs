@@ -1,23 +1,25 @@
-//! 渲染子系统：Vulkan 1.3 唯一后端（`vulkanalia`）。
+//! 渲染子系统：wgpu 首选、Vulkan 1.3（`vulkanalia`）保留的双后端（ADR-0014）。
 //!
-//! 公共 API 不暴露任何 Vulkan 类型；`VulkanCore` 完全封装在 crate 内部
-//! （ADR 0005 / README §5.1 规则 2）。当前已接入实例、物理设备、逻辑设备、
-//! 队列选择、surface、交换链、多帧在飞行（批次 A）、RenderGraph v0.5
-//! （批次 B：声明式 pass/资源 + 编译期 barrier 推导 + GPU pass 时间戳 + 依赖图 dump）
-//! 与自研显存子分配器（批次 E：分桶/块分级/空闲合并 + DeletionQueue 延迟回收）。
+//! 公共 API 不暴露任何图形 API 类型；`WgpuCore` / `VulkanCore` 完全封装在 crate 内部。
+//! 两个后端共用纯数据帧契约、RenderGraph 声明与世代句柄表；Vulkan 侧保留完整
+//! barrier 推导、GPU pass 时间戳、管线缓存与自研显存子分配器。
 //!
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。
 
 mod allocator;
+mod backend;
 mod frame;
 mod geometry;
 mod graph;
 mod material;
 mod mesh;
+mod resource_table;
 mod texture;
 mod vulkan;
+mod wgpu;
 
+pub use backend::{BackendKind, BackendPreference};
 pub use frame::{CameraFrame, InstanceData};
 pub use geometry::{cube, sphere, torus};
 pub use material::{MaterialData, MaterialHandle};
@@ -26,11 +28,24 @@ pub use texture::{ImageFormat, MipRange, TextureData, TextureDataError, TextureH
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
-use vulkan::VulkanCore;
+
+use crate::backend::ActiveBackend;
 
 /// 校验层默认策略：debug 构建开启，单元测试关闭以避免噪音。
 fn default_validation() -> bool {
     cfg!(debug_assertions) && !cfg!(test)
+}
+
+/// 把各候选后端的失败原因拼成一条可读诊断。
+fn describe_attempts(attempts: &[(BackendKind, String)]) -> String {
+    if attempts.is_empty() {
+        return "没有可用的渲染后端候选".to_string();
+    }
+    attempts
+        .iter()
+        .map(|(kind, error)| format!("{kind:?}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// 渲染初始化失败。仅用于诊断；`RenderContext::init` 会记录失败并继续以占位模式运行。
@@ -60,6 +75,10 @@ pub enum RenderInitError {
     Material(String),
     #[error("Vulkan texture creation failed: {0}")]
     Texture(String),
+    #[error("wgpu backend initialization failed: {0}")]
+    Wgpu(String),
+    #[error("all rendering backends failed: {0:?}")]
+    AllBackendsFailed(Vec<(BackendKind, String)>),
     #[error("renderer is not initialized")]
     NotInitialized,
     #[error("renderer is already initialized")]
@@ -82,6 +101,15 @@ pub enum RendererStatus {
         present_mode: Option<String>,
         swapchain_image_count: u32,
     },
+    /// wgpu 已就绪（`backend` 为 wgpu 实际选择的底层 API）。
+    Wgpu {
+        adapter_name: String,
+        backend: String,
+        has_surface: bool,
+        surface_format: Option<String>,
+        present_mode: Option<String>,
+        swapchain_image_count: u32,
+    },
     /// 初始化失败，附可读原因。
     Failed(String),
 }
@@ -92,7 +120,8 @@ pub struct RenderContext {
     initialized: bool,
     width: u32,
     height: u32,
-    backend: Option<VulkanCore>,
+    backend: Option<ActiveBackend>,
+    preference: BackendPreference,
     status: RendererStatus,
     clear_color: [f32; 4],
     camera: CameraFrame,
@@ -112,6 +141,7 @@ impl RenderContext {
             width,
             height,
             backend: None,
+            preference: BackendPreference::default(),
             status: RendererStatus::Uninitialized,
             clear_color: [0.0, 0.0, 0.0, 1.0],
             camera: CameraFrame::default(),
@@ -128,6 +158,12 @@ impl RenderContext {
         self
     }
 
+    /// 覆盖后端偏好；需在 `init` / `init_with_window` 之前调用。
+    pub fn with_backend(mut self, preference: BackendPreference) -> Self {
+        self.preference = preference;
+        self
+    }
+
     /// 覆盖 RenderGraph 依赖图 dump 开关；需在 `init` / `init_with_window` 之前调用。
     ///
     /// 开启后每帧把依赖图 DOT 写入工作目录下的 `render_graph.dot`（调试用，默认关闭）。
@@ -141,36 +177,32 @@ impl RenderContext {
         self.validation
     }
 
-    /// 以 headless 方式初始化：尝试创建 Vulkan 实例与逻辑设备，但不创建 surface。
+    /// 以 headless 方式初始化：按偏好候选顺序创建后端，不创建 surface。
     ///
-    /// 失败时记录 [`RendererStatus::Failed`] 而不 panic，保证 CI/无 GPU 环境可运行。
+    /// 全部失败时记录 [`RendererStatus::Failed`] 而不 panic，保证 CI/无 GPU 环境可运行。
     pub fn init(&mut self) {
         if self.initialized {
             return;
         }
-        match VulkanCore::new_headless(self.validation) {
-            Ok(mut backend) => {
-                self.status = RendererStatus::Vulkan {
-                    device_name: backend.device_name().to_string(),
-                    api_version: backend.api_version().to_string(),
-                    has_surface: backend.has_surface(),
-                    graphics_family: backend.queue_families().0,
-                    present_family: backend.queue_families().1,
-                    surface_format: backend.surface_format().map(str::to_string),
-                    present_mode: backend.present_mode().map(str::to_string),
-                    swapchain_image_count: backend.swapchain_image_count(),
-                };
-                backend.set_graph_dump(self.graph_dump);
-                self.backend = Some(backend);
+        let mut attempts = Vec::new();
+        for kind in self.preference.candidates() {
+            match ActiveBackend::new_headless(*kind, self.validation) {
+                Ok(mut backend) => {
+                    self.status = backend.describe();
+                    backend.set_graph_dump(self.graph_dump);
+                    self.backend = Some(backend);
+                    break;
+                }
+                Err(error) => attempts.push((*kind, error.to_string())),
             }
-            Err(error) => {
-                self.status = RendererStatus::Failed(error.to_string());
-            }
+        }
+        if self.backend.is_none() {
+            self.status = RendererStatus::Failed(describe_attempts(&attempts));
         }
         self.initialized = true;
     }
 
-    /// 使用窗口初始化：创建 Vulkan surface，并要求设备支持呈现。
+    /// 使用窗口初始化：按偏好候选顺序创建后端与 surface/交换链。
     ///
     /// `display` / `window` 由 `mir-window` 的 raw-window-handle 提供；
     /// 窗口必须比 [`RenderContext`] 活得更久（surface 在 Drop 时才销毁）。
@@ -182,29 +214,34 @@ impl RenderContext {
         if self.initialized {
             return Err(RenderInitError::AlreadyInitialized);
         }
-        match VulkanCore::with_surface(display, window, self.width, self.height, self.validation) {
-            Ok(mut backend) => {
-                self.status = RendererStatus::Vulkan {
-                    device_name: backend.device_name().to_string(),
-                    api_version: backend.api_version().to_string(),
-                    has_surface: backend.has_surface(),
-                    graphics_family: backend.queue_families().0,
-                    present_family: backend.queue_families().1,
-                    surface_format: backend.surface_format().map(str::to_string),
-                    present_mode: backend.present_mode().map(str::to_string),
-                    swapchain_image_count: backend.swapchain_image_count(),
-                };
-                backend.set_graph_dump(self.graph_dump);
-                self.backend = Some(backend);
-                self.initialized = true;
-                Ok(())
-            }
-            Err(error) => {
-                self.status = RendererStatus::Failed(error.to_string());
-                self.initialized = true;
-                Err(error)
+        let mut attempts = Vec::new();
+        for kind in self.preference.candidates() {
+            match ActiveBackend::with_window(
+                *kind,
+                display,
+                window,
+                self.width,
+                self.height,
+                self.validation,
+            ) {
+                Ok(mut backend) => {
+                    self.status = backend.describe();
+                    backend.set_graph_dump(self.graph_dump);
+                    self.backend = Some(backend);
+                    self.initialized = true;
+                    return Ok(());
+                }
+                Err(error) => attempts.push((*kind, error.to_string())),
             }
         }
+        self.status = RendererStatus::Failed(describe_attempts(&attempts));
+        self.initialized = true;
+        Err(RenderInitError::AllBackendsFailed(attempts))
+    }
+
+    /// 当前实际生效的后端（初始化成功后为 `Some`）。
+    pub fn backend_kind(&self) -> Option<BackendKind> {
+        self.backend.as_ref().map(ActiveBackend::kind)
     }
 
     /// 是否已完成初始化（含降级为占位模式的情况）。
@@ -238,10 +275,13 @@ impl RenderContext {
             .unwrap_or(&[])
     }
 
-    /// 显存分配器当前未释放的子分配字节数（R-10 泄漏守恒诊断，可用于应用侧资源审计；
-    /// 无后端时为 `None`）。
+    /// 当前后端未释放的资源字节数（泄漏守恒诊断；无后端时为 `None`）。
+    /// Vulkan 是自研子分配器的未释放字节；wgpu 是渲染器主动请求的 buffer/texture 字节数，
+    /// 不等于驱动实际显存分配（ADR-0014）。
     pub fn allocated_bytes(&self) -> Option<u64> {
-        self.backend.as_ref().map(VulkanCore::allocated_bytes)
+        self.backend
+            .as_ref()
+            .and_then(ActiveBackend::allocated_bytes)
     }
 
     /// 当前渲染目标尺寸（随窗口缩放更新）。
@@ -259,7 +299,7 @@ impl RenderContext {
             return;
         }
         if let Some(backend) = self.backend.as_mut()
-            && let Err(error) = backend.recreate_swapchain(width, height)
+            && let Err(error) = backend.resize(width, height)
         {
             self.frame_error = Some(error);
         }
@@ -328,7 +368,7 @@ impl RenderContext {
     /// 销毁材质；句柄无效或已销毁时为空操作（对齐 `destroy_mesh` 语义）。
     pub fn destroy_material(&mut self, handle: MaterialHandle) {
         if let Some(backend) = self.backend.as_mut() {
-            let _ = backend.destroy_material(handle);
+            backend.destroy_material(handle);
         }
     }
 
@@ -344,7 +384,7 @@ impl RenderContext {
     /// 销毁网格；句柄无效或已销毁时为空操作。
     pub fn destroy_mesh(&mut self, handle: MeshHandle) {
         if let Some(backend) = self.backend.as_mut() {
-            let _ = backend.destroy_mesh(handle);
+            backend.destroy_mesh(handle);
         }
     }
 
@@ -365,7 +405,7 @@ impl RenderContext {
     /// 销毁纹理；句柄无效或已销毁时为空操作（对齐 `destroy_mesh` 语义）。
     pub fn destroy_texture(&mut self, handle: TextureHandle) {
         if let Some(backend) = self.backend.as_mut() {
-            let _ = backend.destroy_texture(handle);
+            backend.destroy_texture(handle);
         }
     }
 
@@ -396,6 +436,27 @@ impl RenderContext {
 mod tests {
     use super::*;
 
+    /// Spike/回归：wgpu 经 naga 消费现有 Slang→SPIR-V 产物（ADR-0014）。
+    #[test]
+    fn pbr_spirv_is_accepted_by_naga_with_both_entry_points() {
+        const SPIRV: &[u8] = include_bytes!("../../../shaders/pbr/pbr.spv");
+        let module = ::wgpu::naga::front::spv::parse_u8_slice(SPIRV, &Default::default())
+            .expect("naga 应能解析 pbr.spv");
+        let entries: Vec<_> = module
+            .entry_points
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(entries.contains(&"vertexMain"), "入口：{entries:?}");
+        assert!(entries.contains(&"fragmentMain"), "入口：{entries:?}");
+        ::wgpu::naga::valid::Validator::new(
+            ::wgpu::naga::valid::ValidationFlags::all(),
+            ::wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("naga 应能校验 pbr.spv");
+    }
+
     #[test]
     fn new_context_is_uninitialized() {
         let context = RenderContext::new(1280, 720);
@@ -422,13 +483,29 @@ mod tests {
         assert!(context.is_initialized());
         assert!(matches!(
             context.status(),
-            RendererStatus::Vulkan {
+            RendererStatus::Wgpu {
+                has_surface: false,
+                ..
+            } | RendererStatus::Vulkan {
                 has_surface: false,
                 ..
             } | RendererStatus::Failed(_)
         ));
         context.begin_frame([0.0, 0.0, 0.0, 1.0]);
         context.end_frame();
+    }
+
+    #[test]
+    fn backend_preference_defaults_to_auto_and_can_be_forced() {
+        let context = RenderContext::new(64, 64);
+        assert_eq!(context.preference, BackendPreference::Auto);
+        assert_eq!(context.backend_kind(), None);
+
+        let mut context = RenderContext::new(64, 64).with_backend(BackendPreference::Vulkan);
+        context.init();
+        if !matches!(context.status(), RendererStatus::Failed(_)) {
+            assert_eq!(context.backend_kind(), Some(BackendKind::Vulkan));
+        }
     }
 
     #[test]
@@ -468,7 +545,10 @@ mod tests {
         context.init();
 
         // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
@@ -506,7 +586,10 @@ mod tests {
         context.init();
 
         // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
@@ -536,7 +619,10 @@ mod tests {
     fn texture_upload_validation_layer_when_vulkan_available() {
         let mut context = RenderContext::new(320, 240).with_validation(true);
         context.init();
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
@@ -557,7 +643,10 @@ mod tests {
         context.init();
 
         // 无 Vulkan 设备（CI/无 GPU）的环境直接跳过，保持测试可移植。
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
@@ -645,16 +734,20 @@ mod tests {
         let mut context = RenderContext::new(320, 240);
         context.init();
         // 无 Vulkan 设备（CI/无 GPU）的环境显式跳过，保持测试可移植。
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
+        let baseline = context.allocated_bytes();
         let mesh = crate::cube();
         for _ in 0..1000 {
             let handle = context.create_mesh(&mesh).expect("上传网格");
             context.destroy_mesh(handle);
         }
-        assert_eq!(context.allocated_bytes(), Some(0), "循环后应无残留分配");
+        assert_eq!(context.allocated_bytes(), baseline, "循环后应回到基线");
     }
 
     #[test]
@@ -662,10 +755,14 @@ mod tests {
         // R-10：交错大小的网格反复创建/部分销毁，最终全部销毁后应回到 0。
         let mut context = RenderContext::new(320, 240);
         context.init();
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
+        let baseline = context.allocated_bytes().expect("有设备时统计应存在");
         let mut handles = Vec::new();
         for triangles in [1, 64, 7, 256, 13, 128, 3] {
             handles.push(
@@ -675,7 +772,7 @@ mod tests {
             );
         }
         let allocated = context.allocated_bytes().expect("有设备时分配器统计应存在");
-        assert!(allocated > 0, "存活网格应占用显存统计");
+        assert!(allocated > baseline, "存活网格应占用显存统计");
 
         // 交错销毁一半（先取出另一半，避免 drain 丢句柄），统计应单调下降。
         let survivors: Vec<_> = handles
@@ -693,7 +790,11 @@ mod tests {
         for handle in survivors {
             context.destroy_mesh(handle);
         }
-        assert_eq!(context.allocated_bytes(), Some(0), "全部销毁后应无残留");
+        assert_eq!(
+            context.allocated_bytes(),
+            Some(baseline),
+            "全部销毁后应回到基线"
+        );
     }
 
     #[test]
@@ -701,10 +802,14 @@ mod tests {
         // R-11：headless 下多材质创建/提交/销毁不 panic，且分配守恒（Gate 6 验收路径）。
         let mut context = RenderContext::new(320, 240);
         context.init();
-        if !matches!(context.status(), RendererStatus::Vulkan { .. }) {
+        if !matches!(
+            context.status(),
+            RendererStatus::Wgpu { .. } | RendererStatus::Vulkan { .. }
+        ) {
             return;
         }
 
+        let baseline = context.allocated_bytes();
         // 三种不同参数的材质（金属度/粗糙度对照，供 R-12 演示复用）。
         let gold = MaterialData::new([1.0, 0.77, 0.34, 1.0], 1.0, 0.25, [0.0; 3]);
         let plastic = MaterialData::new([0.8, 0.2, 0.2, 1.0], 0.0, 0.9, [0.0; 3]);
@@ -737,6 +842,6 @@ mod tests {
         assert_ne!(reused, handles[0], "世代号应使旧句柄失效");
         context.destroy_material(reused);
         context.destroy_mesh(mesh);
-        assert_eq!(context.allocated_bytes(), Some(0), "全部销毁后应无残留分配");
+        assert_eq!(context.allocated_bytes(), baseline, "全部销毁后应回到基线");
     }
 }

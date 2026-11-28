@@ -11,10 +11,6 @@ use super::buffer::DeletionEntry;
 /// 材质 UBO（set 1 / binding 0）：std140 布局的 [`MaterialData`]（R-11）。
 const MATERIAL_UBO_SIZE: u64 = std::mem::size_of::<MaterialData>() as u64;
 
-/// 材质槽位上限：决定描述符池容量（每材质 1 个 set 1 描述符集）。
-/// 超出上限后 `create_material` 返回错误；材质销毁会把槽位与描述符集归还复用。
-pub(super) const MAX_MATERIALS: usize = 64;
-
 /// 一个已就绪的 GPU 材质：参数 UBO（HOST_VISIBLE|COHERENT，dedicated 整块分配，
 /// 因为创建时要 map/unmap，不能与 staging 共享同一 DeviceMemory）+ set 1 描述符集。
 pub(super) struct GpuMaterial {
@@ -22,12 +18,6 @@ pub(super) struct GpuMaterial {
     allocation: Allocation,
     /// set 1 描述符集；headless（无描述符池）时为 null，且不会被绘制路径引用。
     pub(super) descriptor_set: vk::DescriptorSet,
-}
-
-/// 材质槽位：世代号用于让销毁后的旧 [`MaterialHandle`] 自动失效（风格对齐 [`super::mesh::MeshSlot`]）。
-pub(super) struct MaterialSlot {
-    generation: u32,
-    material: Option<GpuMaterial>,
 }
 
 impl VulkanCore {
@@ -121,39 +111,20 @@ impl VulkanCore {
             descriptor_set,
         };
 
-        let index = self
-            .free_materials
-            .pop()
-            .unwrap_or(self.materials.len() as u32);
-        let generation = self
-            .materials
-            .get(index as usize)
-            .map(|slot| slot.generation)
-            .unwrap_or(0);
-        let slot = MaterialSlot {
-            generation,
-            material: Some(gpu),
-        };
-        if index as usize == self.materials.len() {
-            self.materials.push(slot);
-        } else {
-            self.materials[index as usize] = slot;
-        }
-        Ok(MaterialHandle::from_parts(index, generation))
+        let (index, generation) = self.materials.insert(gpu);
+        Ok(MaterialHandle::from_parts(index as u32, generation))
     }
 
     /// 创建默认材质（白色 Lambert），绘制路径的兜底。随 `init_pipeline` 调用，
     /// 此时描述符池已就绪。
     pub(super) fn create_default_material(&mut self) -> Result<(), String> {
         let handle = self.create_material(&MaterialData::default())?;
-        let index = handle.index();
+        // 从句柄表取出后槽位进入空闲栈；默认材质不走句柄表，后续用户材质可复用它。
         self.default_material = Some(
-            self.materials[index]
-                .material
-                .take()
+            self.materials
+                .remove(handle.index(), handle.generation())
                 .expect("默认材质槽位刚创建"),
         );
-        // 该槽位永久保留（世代号不递增），不会再被复用——默认材质不走句柄表。
         Ok(())
     }
 
@@ -161,32 +132,22 @@ impl VulkanCore {
     ///
     /// 缓冲经 DeletionQueue 延迟回收；描述符集在 fence 信号后归还描述符池。
     pub(crate) fn destroy_material(&mut self, handle: MaterialHandle) -> bool {
-        let index = handle.index();
-        let Some(slot) = self.materials.get(index) else {
+        let Some(material) = self.materials.remove(handle.index(), handle.generation()) else {
             return false;
         };
-        if slot.generation != handle.generation() {
-            return false;
-        }
-
-        let material = self.materials[index].material.take();
-        self.materials[index].generation = handle.generation().wrapping_add(1);
-        self.free_materials.push(index as u32);
-        if let Some(material) = material {
-            if self.frames.is_empty() {
-                // headless：无帧在飞行，参数 UBO 创建后未被 GPU 引用，立即释放安全。
-                self.release_material(material);
-            } else {
-                // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
-                // 在飞提交已完成（队列操作按提交序完成）。
-                let fence = self.frames[self.frame_index].fence;
-                self.deletions.push(DeletionEntry {
-                    fence,
-                    buffers: vec![(material.buffer, material.allocation)],
-                    descriptor_sets: vec![material.descriptor_set],
-                    images: Vec::new(),
-                });
-            }
+        if self.frames.is_empty() {
+            // headless：无帧在飞行，参数 UBO 创建后未被 GPU 引用，立即释放安全。
+            self.release_material(material);
+        } else {
+            // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
+            // 在飞提交已完成（队列操作按提交序完成）。
+            let fence = self.frames[self.frame_index].fence;
+            self.deletions.push(DeletionEntry {
+                fence,
+                buffers: vec![(material.buffer, material.allocation)],
+                descriptor_sets: vec![material.descriptor_set],
+                images: Vec::new(),
+            });
         }
         true
     }
@@ -201,26 +162,9 @@ impl VulkanCore {
         self.allocator.free(&material.allocation);
     }
 
-    /// 解析材质句柄；世代号不匹配（已被销毁/复用）时返回 `None`。
-    pub(super) fn material_lookup(
-        materials: &[MaterialSlot],
-        handle: MaterialHandle,
-    ) -> Option<&GpuMaterial> {
-        let slot = materials.get(handle.index())?;
-        if slot.generation != handle.generation() {
-            return None;
-        }
-        slot.material.as_ref()
-    }
-
     /// Drop 收尾：释放全部存活材质的缓冲（描述符集随池销毁）。
     pub(super) fn destroy_all_materials(&mut self) {
-        let materials: Vec<GpuMaterial> = self
-            .materials
-            .iter_mut()
-            .filter_map(|slot| slot.material.take())
-            .collect();
-        for material in materials {
+        for material in self.materials.drain() {
             self.release_material(material);
         }
     }

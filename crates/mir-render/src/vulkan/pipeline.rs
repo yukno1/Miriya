@@ -3,11 +3,11 @@
 use vulkanalia::Device;
 use vulkanalia::prelude::v1_0::*;
 
+use crate::frame::{CAMERA_UBO_SIZE, MAX_FRAMES_IN_FLIGHT, PUSH_CONSTANT_SIZE};
+use crate::material::MAX_MATERIALS;
 use crate::mesh::Vertex;
 
 use super::VulkanCore;
-use super::frame::{CAMERA_UBO_SIZE, MAX_FRAMES_IN_FLIGHT};
-use super::material::MAX_MATERIALS;
 use super::pipeline_cache::pipeline_state_hash;
 
 pub(super) struct PipelineResources {
@@ -85,26 +85,6 @@ impl Drop for PipelineGuard<'_> {
                 self.device.destroy_shader_module(module, None);
             }
         }
-    }
-}
-
-/// 逐实例 push constants：`model` + `tint`，共 80 字节（低于 128 字节下限）。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct PushConstants {
-    pub(super) model: [f32; 16],
-    pub(super) tint: [f32; 4],
-}
-
-pub(super) const PUSH_CONSTANT_SIZE: u32 = 80;
-
-pub(super) fn push_constant_bytes(pc: &PushConstants) -> &[u8] {
-    // SAFETY: `PushConstants` 为 repr(C) 且只含 f32，无填充，大小 80。
-    unsafe {
-        std::slice::from_raw_parts(
-            (pc as *const PushConstants).cast::<u8>(),
-            std::mem::size_of::<PushConstants>(),
-        )
     }
 }
 
@@ -433,6 +413,7 @@ impl VulkanCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::PushConstants;
 
     #[test]
     fn push_constant_layout_is_80_bytes() {

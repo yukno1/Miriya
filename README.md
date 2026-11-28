@@ -1,6 +1,6 @@
 # Miriya
 
-> **用 Rust 重写的 Unreal Engine —— Windows + Vulkan 的独立实现子集，玩法使用 C#**
+> **用 Rust 重写的 Unreal Engine —— Windows 的独立实现子集（wgpu 首选渲染，Vulkan 保留），玩法使用 C#**
 >
 > 目标不是把上游 8 万多个 C++ 文件逐行翻译成 Rust，而是以 UE 的模块划分、编辑器工作流与运行时语义为参照，
 > 构建一个现代、内存安全、无 GC 停顿、可由小团队长期维护的 3D 引擎与工具链。
@@ -9,8 +9,8 @@
 |---|---|
 | 上游基线 | Unreal Engine **5.8.4**（同机目录 `../UnrealEngine`，仅作行为参考） |
 | 当前阶段 | **M4 · 资产管线已达成**（M5 材质与光照计划已落盘 `docs/plans/m5-material-lighting.md`，批次 A–G 待执行） |
-| 目标平台 | **Windows x64（Vulkan 1.3）**；Linux 接口保留，暂不发布 |
-| 图形后端 | **Vulkan 1.3，唯一后端（vulkanalia）**；不使用 wgpu / ash / DX12 / OpenGL |
+| 目标平台 | **Windows x64**；Linux 接口保留，暂不发布 |
+| 图形后端 | **wgpu 首选，Vulkan 1.3（vulkanalia）保留为回退/显式后端**；不使用 ash / DX12 / OpenGL 原生 API |
 | 玩法脚本 | **C#（.NET 11）**；不使用蓝图，不使用 WASM 脚本 |
 | 物理 | **仅提供接口（`mir-physics`）**；不实现 Chaos/Rapier 等求解器，由外部后端注入 |
 | 编辑器 | **核心与 UI 框架解耦**（`mir-editor-core`）；GPUI 为候选，egui 可选 |
@@ -156,8 +156,9 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 1. **平台**：当前只支持 **Windows x64**。Linux 不发布，但窗口/输入/文件/线程/音频设备等平台层必须保留
    Linux 接口（trait + 可编译的占位实现 + CI 交叉检查），禁止把 Windows 专有类型（`HWND`、`HINSTANCE` 等）
    暴露到公共 API；后续启用 Linux 时只替换平台后端，不重写子系统。
-2. **图形**：唯一渲染后端是 **Vulkan 1.3，通过 `vulkanalia`**。不引入 wgpu、ash、DX12、OpenGL、Metal，
-   也不做第二套 RHI 抽象；Linux 后续复用同一套 Vulkan 渲染代码。
+2. **图形**：**wgpu 为默认首选后端，手写 Vulkan 1.3（`vulkanalia`）保留为回退与显式后端**（ADR-0014）。
+   默认按 `wgpu → Vulkan` 顺序尝试，可用 `--backend=wgpu|vulkan|auto` 覆盖；公共 API 不暴露任何图形 API 类型。
+   不引入 ash、DX12、OpenGL、Metal 原生 API，也不做第二套动态 RHI 抽象。
 3. **脚本**：**不使用蓝图，也不做任何可视化脚本/节点图系统**。游戏逻辑与创作代码使用 **C#（.NET 11）**，
    引擎侧通过版本化 C ABI 与生成绑定对接；Rust 负责引擎与性能敏感路径。
 4. **C# 的边界**（本计划的默认解释）：C# 用于**游戏逻辑与编辑器中的游戏代码编辑**；编辑器外壳是
@@ -188,7 +189,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 | Actor/Component + World | `Engine` 4,007 文件 | Actor 为「带层级/反射元数据的实体」，数据组件进 ECS；不做 C++ 继承/虚表 | 缓存友好、易并行；代价是保留一层 Actor 兼容外观 |
 | Chaos / 物理引擎 | 大规模自研 | **不实现**；`mir-physics` 只提供 `PhysicsBackend` 接口，外部后端注入 | 引擎不背求解器维护成本，用户可用自研后端；代价是后端契约、集成与性能由外部负责 |
 | Lumen / Nanite | 持续多年研发 | Clustered Forward+、CSM/IBL/SSAO；GI/虚拟几何列为研究 | 先保证稳定可玩；不承诺实时全局光照 |
-| 图形 API / RHI | 多后端（DX12/Vulkan/Metal） | **唯一 Vulkan 1.3 后端（vulkanalia）**；Slang→SPIR-V | 单后端缩小矩阵，Windows/Linux 复用；代价是没有 DX12 兜底，驱动兼容性需矩阵测试 |
+| 图形 API / RHI | 多后端（DX12/Vulkan/Metal） | **wgpu 首选 + Vulkan 1.3（vulkanalia）回退**；Slang→SPIR-V 两后端共用 | 一个公共 API 面覆盖更广驱动；代价是同时维护两套后端实现与更长的编译时间 |
 | Slate / UMG | 464 + 314 文件 | 运行时自研保留式 UI（`mir-ui`）；编辑器核心 `mir-editor-core` 与 UI 框架解耦（GPUI 候选 / egui 可选） | 运行时与工具分离、UI 可替换；代价是需维护 UI 适配层与视口合成方案 |
 | `.uasset` / IoStore / Pak | 复杂二进制 | 自有 `.miasset` / `.mipak`，mmap + 压缩块 | 简单、可版本化、可 fuzz；代价是迁移需导入器 |
 | UBT / UHT / AutomationTool | C# 工具链 | cargo + xtask + 过程宏 + `miriya-cli` | 与 Rust 生态一致；代价是构建缓存/增量需自建 |
@@ -199,7 +200,7 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 **核心依赖选型**（版本在 M0 统一钉在 `[workspace.dependencies]`，以实际兼容性为准）：
 
 - 窗口/输入：`winit`、`gilrs`、`raw-window-handle`
-- 图形：**`vulkanalia`**（唯一图形后端）、自研 Vulkan 子分配器、`slangc`（Slang→SPIR-V，离线预编译）、`spirv-reflect`、`bytemuck`
+- 图形：**`wgpu`（默认首选）** + **`vulkanalia`（保留的 Vulkan 1.3 后端）**、自研 Vulkan 子分配器、`slangc`（Slang→SPIR-V，离线预编译，两后端共用）、`pollster`、`spirv-reflect`、`bytemuck`
 - 数学：`glam`
 - ECS：`hecs`（内部实现，API 可换）
 - 物理：**无内置求解器**；`mir-physics` 只定义接口与调度，实际后端为独立 crate/插件（用户自研）
@@ -263,8 +264,9 @@ Unreal Engine 的开发者体验，同时获得 Rust 的工程收益。
 **硬性规则**：
 
 1. 底层 crate 不依赖上层；`mir-render` 不依赖 `mir-scene`（通过 `Extract` 帧数据解耦）。
-2. **图形后端只有一个**：`mir-render` 通过 `vulkanalia` 独占 Vulkan；Vulkan 类型只出现在 `mir-render` 内部，
-   禁止在运行时/编辑器公共 API 暴露；项目不依赖 wgpu、ash、DX12、OpenGL、Metal。
+2. **图形后端只有两个且共用同一公共 API**：`wgpu`（默认优先）与 `vulkanalia` Vulkan 1.3（回退/显式）；
+   wgpu / Vulkan 类型只出现在 `mir-render` 内部，禁止在运行时/编辑器公共 API 暴露；
+   不依赖 ash、DX12、OpenGL、Metal 原生 API。
 3. 平台层只做平台能力（窗口、设备、文件、计时），不承载玩法或托管运行时。
 4. 每个子系统提供 headless/空后端（Null），保证 CI 与专用服务器可运行。
 5. 子 crate 必须显式声明依赖，禁止通过 facade 的 re-export 形成隐式耦合。
@@ -313,7 +315,7 @@ run():
 
 - `Plugin` trait：`register(engine)`，向 `Schedule`/`RenderGraph`/资产类型注册系统与资源；卸载按逆序。
 - 一等 crate 即插件（feature flag 可裁剪编译），第三方以独立 Rust crate 或 **C# 程序集**接入（不使用 WASM）。
-- 项目清单 `Miriya.toml`：项目名、启动关卡、渲染配置（`backend = "vulkan"`）、物理后端、编辑器 UI 后端、
+- 项目清单 `Miriya.toml`：项目名、启动关卡、渲染配置（`backend = "auto" | "wgpu" | "vulkan"`）、物理后端、编辑器 UI 后端、
   音频配置、插件列表、C# 程序集（`[scripting]`）、资产目录。
 
 ### 5.5 Windows 当前实现 / Linux 接口保留
@@ -425,7 +427,7 @@ Miriya/
 │   ├── mir-asset/              # 资产服务器/注册表/导入器
 │   ├── mir-serialize/          # 版本化序列化
 │   ├── mir-shader/             # Slang→SPIR-V、反射、缓存、热重载
-│   ├── mir-render/             # Vulkan（vulkanalia）与 RenderGraph（M2）
+│   ├── mir-render/             # wgpu（首选）/ Vulkan（vulkanalia，回退）与 RenderGraph
 │   ├── mir-window/             # winit 窗口
 │   ├── mir-input/              # 输入动作映射
 │   ├── mir-platform/           # 文件/系统/计时等平台服务
@@ -468,7 +470,7 @@ Miriya/
 | `mir-math` | glam newtype：`Vec2/3/4`、`Mat3/4`、`Quat`、`Transform`、`interop`（厘米/米集中转换）、`Aabb`/`Frustum`（含世界空间 AABB 变换），serde 数组表示，含测试 | ✅ 可用 | M4 补齐 `Ray`/`Plane`/`Color` 与 glTF/物理边界 interop |
 | `mir-ecs` | `hecs` 门面：世代 `Entity`、`Ref`/`Mut` 守卫、回调式查询、类型化 Resource、Added/Changed 变更追踪、`EcsError` | ✅ 可用 | M7 接入 `Schedule` 与并行查询 |
 | `mir-input` | winit 事件驱动的键鼠状态、按键沿、鼠标增量与失焦清理 | 🟡 原型 | Action 映射、键位重绑、手柄（M7） |
-| `mir-render` | Vulkan 1.3 完整绘制链路：交换链/深度/网格上传/UBO/push constants、校验层与日志桥接、2 帧在飞行、RenderGraph v0.5（自动 barrier/别名/GPU 时间戳/dump）、单 `.spv` 多入口、管线缓存持久化、自研显存子分配器（分桶/块分级/空闲合并/DeletionQueue 延迟回收）、材质系统（per-material UBO + 世代句柄）、基础 PBR（GGX metallic-roughness + 单方向光）、视锥剔除（extract 侧） | 🟡 原型 | 多光源/纹理/IBL、glTF 资产（M4/M5） |
+| `mir-render` | 双后端（`wgpu` 默认优先、`vulkanalia` Vulkan 1.3 回退），公共 API 统一；交换链/深度/网格/材质/纹理上传、单 `.spv` 多入口、基础 PBR、RenderGraph（Vulkan 自动 barrier/别名/GPU 时间戳/dump；wgpu 复用 pass 序与 dump）、2 帧在飞行、Vulkan 管线缓存与自研显存子分配器、世代句柄、extract 侧视锥剔除 | 🟡 原型 | wgpu GPU 时间戳、多光源/纹理绑定/IBL、glTF 资产 |
 | `mir-window` | winit 0.30 窗口/事件循环、raw-window-handle、光标捕获与失焦自动释放 | 🟡 原型 | DPI 缩放、挂起/恢复处理（M2 剩余） |
 | `mir-asset` | UUIDv7 `AssetId`、类型化句柄、注册表/依赖图/缓存分离、rayon 异步加载、`.miasset` 分块 zstd 容器、glTF/PNG/KTX2/WAV/OGG 导入、notify 热重载与可诊断错误 | ✅ 可用 | M5 纹理 GPU 上传；M13 接入 cook/pack |
 | `mir-image` | PNG → RGBA8、KTX2 头解析与透传、图像数据错误化 | ✅ 可用 | M5 纹理采样/压缩格式支持 |

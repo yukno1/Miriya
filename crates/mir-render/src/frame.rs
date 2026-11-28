@@ -6,6 +6,34 @@ use mir_math::Mat4;
 
 use crate::{MaterialHandle, MeshHandle};
 
+/// 相机 UBO（set 0 / binding 0）：`view_proj`（64 B）+ `camera_position`
+/// （std140 vec3，偏移 64，含补齐共 80 B）。两个后端共享同一字节布局。
+pub(crate) const CAMERA_UBO_SIZE: u64 = 80;
+
+/// 帧在飞行数：相机 UBO 环形缓冲的份数（两个后端共享）。
+pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// 逐实例 push constants：模型矩阵 + tint，共 80 字节（低于 128 字节下限）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PushConstants {
+    pub(crate) model: [f32; 16],
+    pub(crate) tint: [f32; 4],
+}
+
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = 80;
+
+/// push constants 的字节视图（repr(C) 且只含 f32，无填充）。
+pub(crate) fn push_constant_bytes(pc: &PushConstants) -> &[u8] {
+    // SAFETY: `PushConstants` 为 repr(C) 且只含 f32，无填充，大小 80。
+    unsafe {
+        std::slice::from_raw_parts(
+            (pc as *const PushConstants).cast::<u8>(),
+            std::mem::size_of::<PushConstants>(),
+        )
+    }
+}
+
 /// 相机帧数据。
 ///
 /// R-12 起 PBR 高光需要相机世界位置（视线方向 `V = normalize(camera_position - world_pos)`）；
@@ -55,6 +83,17 @@ pub(crate) struct DrawInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_gpu_layouts_are_stable() {
+        assert_eq!(CAMERA_UBO_SIZE, 80);
+        assert_eq!(MAX_FRAMES_IN_FLIGHT, 2);
+        assert_eq!(
+            std::mem::size_of::<PushConstants>(),
+            PUSH_CONSTANT_SIZE as usize
+        );
+        assert_eq!(std::mem::align_of::<PushConstants>(), 4);
+    }
 
     #[test]
     fn defaults_are_identity_and_white() {

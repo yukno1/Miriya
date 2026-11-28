@@ -9,14 +9,10 @@
 use vulkanalia::prelude::v1_0::*;
 
 use crate::allocator::Allocation;
-use crate::texture::{ImageFormat, TextureData, TextureHandle, mip_dimension};
+use crate::texture::{ImageFormat, MAX_TEXTURES, TextureData, TextureHandle, mip_dimension};
 
 use super::VulkanCore;
 use super::buffer::{DeletionEntry, DeletionImage};
-
-/// 纹理槽位上限（与 `MAX_MATERIALS` 语义一致：超限 `create_texture` 返回错误，
-/// 槽位销毁后复用，世代号递增）。
-pub(super) const MAX_TEXTURES: usize = 128;
 
 /// 一个已就绪的 GPU 纹理：image + 显存 + 视图 + 采样器。
 pub(super) struct GpuTexture {
@@ -29,12 +25,6 @@ pub(super) struct GpuTexture {
     pub(super) format: vk::Format,
     #[allow(dead_code)]
     pub(super) mip_levels: u32,
-}
-
-/// 纹理槽位：世代号用于让销毁后的旧 [`TextureHandle`] 自动失效。
-pub(super) struct TextureSlot {
-    generation: u32,
-    texture: Option<GpuTexture>,
 }
 
 /// [`ImageFormat`] → `vk::Format`（M5 支持的未压缩格式全集）。
@@ -64,7 +54,7 @@ impl VulkanCore {
     ///
     /// headless（无交换链/帧资源）同样可创建：设备与分配器均可用，销毁走立即释放。
     pub(crate) fn create_texture(&mut self, data: &TextureData) -> Result<TextureHandle, String> {
-        if self.textures.len() >= MAX_TEXTURES && self.free_textures.is_empty() {
+        if self.textures.len() >= MAX_TEXTURES && !self.textures.has_free() {
             return Err(format!("纹理槽位已满（MAX_TEXTURES = {MAX_TEXTURES}）"));
         }
         let format = vk_format(data.format);
@@ -200,25 +190,8 @@ impl VulkanCore {
             mip_levels,
         };
 
-        let index = self
-            .free_textures
-            .pop()
-            .unwrap_or(self.textures.len() as u32);
-        let generation = self
-            .textures
-            .get(index as usize)
-            .map(|slot| slot.generation)
-            .unwrap_or(0);
-        let slot = TextureSlot {
-            generation,
-            texture: Some(gpu),
-        };
-        if index as usize == self.textures.len() {
-            self.textures.push(slot);
-        } else {
-            self.textures[index as usize] = slot;
-        }
-        Ok(TextureHandle::from_parts(index, generation))
+        let (index, generation) = self.textures.insert(gpu);
+        Ok(TextureHandle::from_parts(index as u32, generation))
     }
 
     /// staging 上传 mip 链并转入 `SHADER_READ_ONLY_OPTIMAL`（阻塞：submit + wait_idle）。
@@ -364,37 +337,27 @@ impl VulkanCore {
     ///
     /// GPU 资源经 DeletionQueue 绑定 frame fence 延迟回收（headless 立即释放）。
     pub(crate) fn destroy_texture(&mut self, handle: TextureHandle) -> bool {
-        let index = handle.index();
-        let Some(slot) = self.textures.get(index) else {
+        let Some(texture) = self.textures.remove(handle.index(), handle.generation()) else {
             return false;
         };
-        if slot.generation != handle.generation() {
-            return false;
-        }
-
-        let texture = self.textures[index].texture.take();
-        self.textures[index].generation = handle.generation().wrapping_add(1);
-        self.free_textures.push(index as u32);
-        if let Some(texture) = texture {
-            if self.frames.is_empty() {
-                // headless：无帧在飞行，上传路径已同步等待队列，立即释放安全。
-                self.release_texture(texture);
-            } else {
-                // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
-                // 在飞提交已完成（队列操作按提交序完成）。
-                let fence = self.frames[self.frame_index].fence;
-                self.deletions.push(DeletionEntry {
-                    fence,
-                    buffers: Vec::new(),
-                    descriptor_sets: Vec::new(),
-                    images: vec![DeletionImage {
-                        image: texture.image,
-                        allocation: texture.allocation,
-                        view: texture.view,
-                        sampler: texture.sampler,
-                    }],
-                });
-            }
+        if self.frames.is_empty() {
+            // headless：无帧在飞行，上传路径已同步等待队列，立即释放安全。
+            self.release_texture(texture);
+        } else {
+            // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
+            // 在飞提交已完成（队列操作按提交序完成）。
+            let fence = self.frames[self.frame_index].fence;
+            self.deletions.push(DeletionEntry {
+                fence,
+                buffers: Vec::new(),
+                descriptor_sets: Vec::new(),
+                images: vec![DeletionImage {
+                    image: texture.image,
+                    allocation: texture.allocation,
+                    view: texture.view,
+                    sampler: texture.sampler,
+                }],
+            });
         }
         true
     }
@@ -412,28 +375,9 @@ impl VulkanCore {
 
     /// Drop 收尾：释放全部存活纹理（设备已 wait_idle，可立即销毁）。
     pub(super) fn destroy_all_textures(&mut self) {
-        let textures: Vec<GpuTexture> = self
-            .textures
-            .iter_mut()
-            .filter_map(|slot| slot.texture.take())
-            .collect();
-        for texture in textures {
+        for texture in self.textures.drain() {
             self.release_texture(texture);
         }
-    }
-
-    /// 解析纹理句柄；世代号不匹配（已被销毁/复用）时返回 `None`。
-    /// 批次 B 由材质描述符绑定路径（render.rs 绘制循环）调用。
-    #[allow(dead_code)]
-    pub(super) fn texture_lookup(
-        textures: &[TextureSlot],
-        handle: TextureHandle,
-    ) -> Option<&GpuTexture> {
-        let slot = textures.get(handle.index())?;
-        if slot.generation != handle.generation() {
-            return None;
-        }
-        slot.texture.as_ref()
     }
 }
 

@@ -16,6 +16,9 @@ edition = "2024"
 miriya-engine = { path = "crates/miriya-engine" }
 thiserror = "2"
 vulkanalia = { version = "0.35", features = ["libloading", "window"] }
+# wgpu 首选后端；spirv feature 复用 Slang 离线编译的 .spv（ADR-0014）。
+wgpu = { version = "30", features = ["spirv"] }
+pollster = "1"
 raw-window-handle = "0.6"
 # M3：ECS 内核、场景快照与基准。统一在 workspace 钉版本，子 crate 显式引用。
 hecs = "0.10"

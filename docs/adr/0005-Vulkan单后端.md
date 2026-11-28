@@ -1,7 +1,7 @@
 # ADR 0005：Vulkan 唯一图形后端
 
 - 日期：2026-11-18
-- 状态：Accepted
+- 状态：Superseded by ADR 0014（wgpu 首选，Vulkan 保留为回退/显式后端；原文保留作历史）
 - 关联：README §5.1 规则 2、§9.6、§11.6、RFC 0001
 
 ## 背景

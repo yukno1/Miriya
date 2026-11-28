@@ -11,6 +11,7 @@ use vulkanalia::window as vulkan_window;
 
 use crate::RenderInitError;
 use crate::allocator::MemoryAllocator;
+use crate::resource_table::SlotTable;
 
 use super::VulkanCore;
 use super::debug::{create_debug_messenger, validation_layer_available};
@@ -307,12 +308,9 @@ impl VulkanCore {
             present_queue,
             transfer_pool,
             transfer_command_buffer,
-            meshes: Vec::new(),
-            free_meshes: Vec::new(),
-            materials: Vec::new(),
-            free_materials: Vec::new(),
-            textures: Vec::new(),
-            free_textures: Vec::new(),
+            meshes: SlotTable::new(),
+            materials: SlotTable::new(),
+            textures: SlotTable::new(),
             default_material: None,
             deletions: Vec::new(),
             allocator,

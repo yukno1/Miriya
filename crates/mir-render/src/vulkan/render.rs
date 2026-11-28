@@ -3,13 +3,15 @@
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::vk::{DeviceV1_3, KhrSwapchainExtensionDeviceCommands};
 
-use crate::frame::{CameraFrame, DrawInstance};
+use crate::frame::{
+    CAMERA_UBO_SIZE, CameraFrame, DrawInstance, MAX_FRAMES_IN_FLIGHT, PushConstants,
+    push_constant_bytes,
+};
 use crate::graph;
 
 use super::VulkanCore;
-use super::frame::{CAMERA_UBO_SIZE, MAX_FRAMES_IN_FLIGHT, TIMESTAMP_QUERY_COUNT};
+use super::frame::TIMESTAMP_QUERY_COUNT;
 use super::frame_graph::{emit_image_barrier, read_pass_timings};
-use super::pipeline::{PushConstants, push_constant_bytes};
 
 impl VulkanCore {
     /// 当前交换链尺寸是否与应用层已知的窗口尺寸不一致。
@@ -251,11 +253,13 @@ impl VulkanCore {
                             // set 1（材质）：按需换绑——材质句柄无效或未提供时回退默认材质。
                             let mut bound_material_set = vk::DescriptorSet::null();
                             for draw in draws {
-                                let Some(mesh) = Self::mesh_lookup(&self.meshes, draw.mesh) else {
+                                let Some(mesh) =
+                                    self.meshes.get(draw.mesh.index(), draw.mesh.generation())
+                                else {
                                     continue;
                                 };
                                 let material_set = match draw.material.and_then(|handle| {
-                                    Self::material_lookup(&self.materials, handle)
+                                    self.materials.get(handle.index(), handle.generation())
                                 }) {
                                     Some(material) => material.descriptor_set,
                                     None => {

@@ -6,17 +6,13 @@ use vulkanalia::vk::DeviceV1_3;
 
 use crate::frame::DrawInstance;
 use crate::graph;
-use crate::mesh::MeshHandle;
+use crate::graph::GRAPH_DUMP_PATH;
 
 use super::VulkanCore;
 
-/// `--graph-dump` 开启时每帧覆盖写入的依赖图 DOT 文件（工作目录下）。
-const GRAPH_DUMP_PATH: &str = "render_graph.dot";
-
 impl VulkanCore {
-    /// 声明本帧的 RenderGraph（R-03）：imported 交换链图像（UNDEFINED → PRESENT）、
-    /// 深度图像（静态 DEPTH_ATTACHMENT_OPTIMAL）与绘制引用的网格 buffer，单个 graphics pass。
-    /// 返回图与 resource → (image, aspect) 的翻译表，供 barrier 生成时定位 vk::Image。
+    /// 声明本帧的 RenderGraph（R-03）：复用共享的纯数据声明，额外返回
+    /// resource → (image, aspect) 的翻译表，供 barrier 生成时定位 `vk::Image`。
     pub(super) fn build_frame_graph(
         &self,
         draws: &[DrawInstance],
@@ -25,40 +21,20 @@ impl VulkanCore {
         graph::RenderGraph,
         Vec<(graph::ResourceId, vk::Image, vk::ImageAspectFlags)>,
     ) {
-        let mut frame_graph = graph::RenderGraph::new();
-        let swapchain = frame_graph.import_image(
-            "swapchain".to_string(),
-            graph::ImageLayout::Undefined,
-            Some(graph::ImageLayout::Present),
-        );
-        let depth = frame_graph.import_image(
-            "depth".to_string(),
-            graph::ImageLayout::DepthAttachment,
-            None,
-        );
-        // 本帧绘制用到的网格 buffer：作为 imported 资源进入图（无布局、不生成 barrier，
-        // 用于依赖图 dump 的完整性）。
-        let mut meshes_seen: Vec<MeshHandle> = Vec::new();
-        for draw in draws {
-            if !meshes_seen.contains(&draw.mesh) {
-                frame_graph.import_buffer(format!(
-                    "mesh[{}g{}]",
-                    draw.mesh.index(),
-                    draw.mesh.generation()
-                ));
-                meshes_seen.push(draw.mesh);
-            }
-        }
-        frame_graph.add_graphics_pass("main_geometry".to_string(), vec![swapchain], Some(depth));
-
+        let frame_graph = graph::build_frame_graph(draws);
+        // 声明顺序固定：swapchain = 0，depth = 1（见 `graph::build_frame_graph`）。
         let mut images = Vec::with_capacity(2);
         images.push((
-            swapchain,
+            graph::ResourceId(0),
             self.swapchain_images[image_index as usize],
             vk::ImageAspectFlags::COLOR,
         ));
         if let Some(depth_resources) = &self.depth {
-            images.push((depth, depth_resources.image, vk::ImageAspectFlags::DEPTH));
+            images.push((
+                graph::ResourceId(1),
+                depth_resources.image,
+                vk::ImageAspectFlags::DEPTH,
+            ));
         }
         (frame_graph, images)
     }

@@ -6,6 +6,9 @@
 //!
 //! 渲染层只接受纯数据，不访问 ECS/场景（ADR-0012 extract 边界）。
 
+/// 材质槽位上限（两后端共享；同时决定 Vulkan 描述符池容量）。
+pub(crate) const MAX_MATERIALS: usize = 64;
+
 /// 材质参数（PBR metallic-roughness，R-11）。
 ///
 /// std140 布局对应：`vec4 base_color`（align 16）→ `float metallic` → `float roughness`

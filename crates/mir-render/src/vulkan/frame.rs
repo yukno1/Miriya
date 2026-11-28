@@ -3,18 +3,12 @@
 use vulkanalia::prelude::v1_0::*;
 
 use crate::allocator::Allocation;
+use crate::frame::{CAMERA_UBO_SIZE, MAX_FRAMES_IN_FLIGHT};
 
 use super::VulkanCore;
 
-/// 帧在飞行数：CPU 可领先 GPU 的帧数。每帧拥有独立的命令资源、同步原语与相机 UBO。
-pub(super) const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
 /// GPU 时间戳查询池容量：每 pass 2 个查询（pass 起/止），按 32 个 pass 上限预留。
 pub(super) const TIMESTAMP_QUERY_COUNT: u32 = 64;
-
-/// 相机 UBO（set 0 / binding 0）：`view_proj`（64 B）+ `camera_position`（std140 vec3，
-/// 偏移 64，含补齐共 80 B，R-12）。
-pub(super) const CAMERA_UBO_SIZE: u64 = 80;
 
 /// 单帧录制与同步资源；共 [`MAX_FRAMES_IN_FLIGHT`] 份环形复用，
 /// 复用前通过本帧 fence 等待上一轮该帧的 GPU 工作完成。

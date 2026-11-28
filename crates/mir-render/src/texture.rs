@@ -11,6 +11,9 @@ use std::fmt;
 
 use thiserror::Error;
 
+/// 纹理槽位上限（两后端共享）。
+pub(crate) const MAX_TEXTURES: usize = 128;
+
 /// 图像格式（纯数据枚举，覆盖 M5 实际用到的未压缩格式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {

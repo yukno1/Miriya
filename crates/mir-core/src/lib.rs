@@ -21,6 +21,8 @@ pub struct EngineConfig {
     pub max_frames: Option<u64>,
     /// Vulkan 校验层开关；debug 默认开启，单元测试默认关闭以避免噪音。
     pub validation: bool,
+    /// 渲染后端偏好：默认先 wgpu，失败自动回退手写 Vulkan 后端。
+    pub backend: mir_render::BackendPreference,
 }
 
 impl Default for EngineConfig {
@@ -32,6 +34,7 @@ impl Default for EngineConfig {
             target_fps: 60,
             max_frames: None,
             validation: cfg!(debug_assertions) && !cfg!(test),
+            backend: mir_render::BackendPreference::default(),
         }
     }
 }
@@ -108,7 +111,8 @@ fn make_context(config: &EngineConfig) -> EngineContext {
         time: Time::new(),
         input: mir_input::InputState::default(),
         renderer: mir_render::RenderContext::new(config.width, config.height)
-            .with_validation(config.validation),
+            .with_validation(config.validation)
+            .with_backend(config.backend),
         assets: mir_asset::AssetServer::new(),
         stats: FrameStats::default(),
         cursor_capture_request: None,

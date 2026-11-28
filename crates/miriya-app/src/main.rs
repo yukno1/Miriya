@@ -7,7 +7,9 @@ use miriya_engine::math::interop::{
     meters_to_centimeters as m_to_cm, meters_to_centimeters_vec3 as mvec_to_cm,
 };
 use miriya_engine::math::{Aabb, Frustum, Quat, Transform, Vec2, Vec3};
-use miriya_engine::render::{CameraFrame, InstanceData, MaterialData, MaterialHandle, MeshHandle};
+use miriya_engine::render::{
+    BackendPreference, CameraFrame, InstanceData, MaterialData, MaterialHandle, MeshHandle,
+};
 use miriya_engine::scene::{
     ActorId, Camera, CameraController, CameraInput, Level, WorldTransforms,
 };
@@ -202,10 +204,11 @@ impl Game {
 impl AppState for Game {
     fn on_start(&mut self, ctx: &mut EngineContext) {
         println!(
-            "游戏启动，Actor 数：{}，窗口：{}x{}",
+            "游戏启动，Actor 数：{}，窗口：{}x{}，渲染后端：{:?}",
             self.level.actor_count(),
             ctx.renderer.size().0,
-            ctx.renderer.size().1
+            ctx.renderer.size().1,
+            ctx.renderer.status()
         );
         // M4：资产根目录相对仓库；cook 产物缺失时走程序化回退，不阻塞启动。
         ctx.assets.set_root("assets");
@@ -433,6 +436,7 @@ fn main() {
     };
     let stats_enabled = args.iter().any(|arg| arg == "--stats");
     let graph_dump = args.iter().any(|arg| arg == "--graph-dump");
+    let backend = parse_backend(&args);
 
     let config = EngineConfig {
         title: "Miriya Demo".to_string(),
@@ -441,6 +445,7 @@ fn main() {
         max_frames,
         target_fps: if headless { 0 } else { 60 },
         validation,
+        backend,
     };
     let engine = miriya_engine::Engine::new(config);
     let mut game = Game::new(stats_enabled, graph_dump);
@@ -457,6 +462,33 @@ fn axis(ctx: &EngineContext, positive: KeyCode, negative: KeyCode) -> f32 {
     let positive = i8::from(ctx.input.is_down(positive));
     let negative = i8::from(ctx.input.is_down(negative));
     f32::from(positive - negative)
+}
+
+/// 解析 `--backend=wgpu|vulkan|auto` / `--backend wgpu`。
+fn parse_backend(args: &[String]) -> BackendPreference {
+    let value = parse_str_arg(args, "--backend").map(str::to_ascii_lowercase);
+    match value.as_deref() {
+        Some("wgpu") => BackendPreference::Wgpu,
+        Some("vulkan") => BackendPreference::Vulkan,
+        Some("auto") | None => BackendPreference::Auto,
+        Some(other) => {
+            eprintln!("未知渲染后端 {other}，回退到 auto");
+            BackendPreference::Auto
+        }
+    }
+}
+
+fn parse_str_arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix(&prefix) {
+            return Some(value);
+        }
+        if arg == name {
+            return args.get(index + 1).map(String::as_str);
+        }
+    }
+    None
 }
 
 /// 解析 `--frames N` / `--frames=N`。

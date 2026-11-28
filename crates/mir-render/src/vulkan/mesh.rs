@@ -18,12 +18,6 @@ pub(super) struct GpuMesh {
     pub(super) index_count: u32,
 }
 
-/// 网格槽位：世代号用于让销毁后的旧 [`MeshHandle`] 自动失效。
-pub(super) struct MeshSlot {
-    generation: u32,
-    mesh: Option<GpuMesh>,
-}
-
 impl VulkanCore {
     /// 创建 GPU 网格：staging → device-local，阻塞式上传（v0.2 网格极少，成本可忽略）。
     pub(crate) fn create_mesh(&mut self, data: &MeshData) -> Result<MeshHandle, String> {
@@ -32,55 +26,31 @@ impl VulkanCore {
         }
         let mesh = self.upload_mesh(data)?;
 
-        let index = self.free_meshes.pop().unwrap_or(self.meshes.len() as u32);
-        let generation = self
-            .meshes
-            .get(index as usize)
-            .map(|slot| slot.generation)
-            .unwrap_or(0);
-        let slot = MeshSlot {
-            generation,
-            mesh: Some(mesh),
-        };
-        if index as usize == self.meshes.len() {
-            self.meshes.push(slot);
-        } else {
-            self.meshes[index as usize] = slot;
-        }
-        Ok(MeshHandle::from_parts(index, generation))
+        let (index, generation) = self.meshes.insert(mesh);
+        Ok(MeshHandle::from_parts(index as u32, generation))
     }
 
     /// 销毁网格；句柄无效或世代不匹配时返回 `false`（旧句柄不会误删新网格）。
     pub(crate) fn destroy_mesh(&mut self, handle: MeshHandle) -> bool {
-        let index = handle.index();
-        let Some(slot) = self.meshes.get(index) else {
+        let Some(mesh) = self.meshes.remove(handle.index(), handle.generation()) else {
             return false;
         };
-        if slot.generation != handle.generation() {
-            return false;
-        }
-
-        let mesh = self.meshes[index].mesh.take();
-        self.meshes[index].generation = handle.generation().wrapping_add(1);
-        self.free_meshes.push(index as u32);
-        if let Some(mesh) = mesh {
-            if self.frames.is_empty() {
-                // headless：无帧在飞行，上传路径已同步等待队列，立即释放安全。
-                self.release_mesh(mesh);
-            } else {
-                // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
-                // 在飞提交已完成（队列操作按提交序完成）。
-                let fence = self.frames[self.frame_index].fence;
-                self.deletions.push(DeletionEntry {
-                    fence,
-                    buffers: vec![
-                        (mesh.vertex_buffer, mesh.vertex_allocation),
-                        (mesh.index_buffer, mesh.index_allocation),
-                    ],
-                    descriptor_sets: Vec::new(),
-                    images: Vec::new(),
-                });
-            }
+        if self.frames.is_empty() {
+            // headless：无帧在飞行，上传路径已同步等待队列，立即释放安全。
+            self.release_mesh(mesh);
+        } else {
+            // 延迟回收（R-09）：绑定下一帧的 fence——其信号保证所有更早的
+            // 在飞提交已完成（队列操作按提交序完成）。
+            let fence = self.frames[self.frame_index].fence;
+            self.deletions.push(DeletionEntry {
+                fence,
+                buffers: vec![
+                    (mesh.vertex_buffer, mesh.vertex_allocation),
+                    (mesh.index_buffer, mesh.index_allocation),
+                ],
+                descriptor_sets: Vec::new(),
+                images: Vec::new(),
+            });
         }
         true
     }
@@ -94,15 +64,6 @@ impl VulkanCore {
         }
         self.allocator.free(&mesh.vertex_allocation);
         self.allocator.free(&mesh.index_allocation);
-    }
-
-    /// 解析网格句柄；世代号不匹配（已被销毁/复用）时返回 `None`。
-    pub(super) fn mesh_lookup(meshes: &[MeshSlot], handle: MeshHandle) -> Option<&GpuMesh> {
-        let slot = meshes.get(handle.index())?;
-        if slot.generation != handle.generation() {
-            return None;
-        }
-        slot.mesh.as_ref()
     }
 
     fn upload_mesh(&mut self, data: &MeshData) -> Result<GpuMesh, String> {
@@ -129,13 +90,8 @@ impl VulkanCore {
 
     /// Drop 收尾：释放全部存活网格的缓冲。
     pub(super) fn destroy_all_meshes(&mut self) {
-        // 先收集再释放，避免同时借用 `self.meshes` 与 `self.device`。
-        let meshes: Vec<GpuMesh> = self
-            .meshes
-            .iter_mut()
-            .filter_map(|slot| slot.mesh.take())
-            .collect();
-        for mesh in meshes {
+        // 先排空再释放，避免同时借用 `self.meshes` 与 `self.device`。
+        for mesh in self.meshes.drain() {
             self.release_mesh(mesh);
         }
     }

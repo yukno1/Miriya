@@ -21,7 +21,12 @@ use std::collections::{BinaryHeap, HashSet};
 
 use thiserror::Error;
 
+use crate::frame::DrawInstance;
+use crate::mesh::MeshHandle;
 use crate::texture::ImageFormat;
+
+/// `--graph-dump` 开启时每帧覆盖写入的依赖图 DOT 文件（工作目录下，两后端共用）。
+pub(crate) const GRAPH_DUMP_PATH: &str = "render_graph.dot";
 
 /// pass 在图中的句柄（下标即声明顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -312,6 +317,34 @@ pub(crate) struct CompiledGraph {
 pub(crate) struct RenderGraph {
     passes: Vec<PassDesc>,
     resources: Vec<ResourceDesc>,
+}
+
+/// 构建每帧的声明式图（Vulkan / wgpu 共享）。
+///
+/// 交换链图像从 `UNDEFINED` 进入图、帧末转到 `PRESENT`；深度图像创建时已是
+/// `DEPTH_ATTACHMENT`，静态布局不生成 barrier；本帧绘制引用的网格 buffer
+/// 作为 imported 资源进入图（仅供校验与 DOT dump，不参与布局追踪）。
+pub(crate) fn build_frame_graph(draws: &[DrawInstance]) -> RenderGraph {
+    let mut graph = RenderGraph::new();
+    let swapchain = graph.import_image(
+        "swapchain".to_string(),
+        ImageLayout::Undefined,
+        Some(ImageLayout::Present),
+    );
+    let depth = graph.import_image("depth".to_string(), ImageLayout::DepthAttachment, None);
+    let mut meshes_seen: Vec<MeshHandle> = Vec::new();
+    for draw in draws {
+        if !meshes_seen.contains(&draw.mesh) {
+            graph.import_buffer(format!(
+                "mesh[{}g{}]",
+                draw.mesh.index(),
+                draw.mesh.generation()
+            ));
+            meshes_seen.push(draw.mesh);
+        }
+    }
+    graph.add_graphics_pass("main_geometry".to_string(), vec![swapchain], Some(depth));
+    graph
 }
 
 impl RenderGraph {

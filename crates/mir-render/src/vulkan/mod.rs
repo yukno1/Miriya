@@ -26,6 +26,7 @@ use vulkanalia::{Device, Entry, Instance};
 
 use crate::RenderInitError;
 use crate::allocator::MemoryAllocator;
+use crate::resource_table::SlotTable;
 
 mod buffer;
 mod debug;
@@ -44,10 +45,10 @@ mod texture;
 use buffer::DeletionEntry;
 use depth::DepthResources;
 use frame::FrameResources;
-use material::{GpuMaterial, MaterialSlot};
-use mesh::MeshSlot;
+use material::GpuMaterial;
+use mesh::GpuMesh;
 use pipeline::PipelineResources;
-use texture::TextureSlot;
+use texture::GpuTexture;
 
 /// Vulkan 核心对象。按 frame → pipeline → image views → swapchain → surface → device → instance 的逆序销毁。
 pub(super) struct VulkanCore {
@@ -79,14 +80,12 @@ pub(super) struct VulkanCore {
     /// 上传/布局转换专用的命令池与命令缓冲（同步使用，不参与每帧录制）。
     transfer_pool: vk::CommandPool,
     transfer_command_buffer: vk::CommandBuffer,
-    meshes: Vec<MeshSlot>,
-    free_meshes: Vec<u32>,
-    /// 材质槽位表（R-11）与空闲槽位（复用时世代号递增）。
-    materials: Vec<MaterialSlot>,
-    free_materials: Vec<u32>,
-    /// 纹理槽位表（M5 批次 A）与空闲槽位（复用时世代号递增）。
-    textures: Vec<TextureSlot>,
-    free_textures: Vec<u32>,
+    /// 网格槽位表（世代号 + 空闲栈，两后端共享实现）。
+    meshes: SlotTable<GpuMesh>,
+    /// 材质槽位表（R-11）。
+    materials: SlotTable<GpuMaterial>,
+    /// 纹理槽位表（M5 批次 A）。
+    textures: SlotTable<GpuTexture>,
     /// 默认材质（白色 Lambert）：随 `init_pipeline` 创建，绘制路径在材质句柄
     /// 无效/未提供时回退到它。
     default_material: Option<GpuMaterial>,
