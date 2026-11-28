@@ -26,11 +26,16 @@
 [12. 风险与应对](#12-风险与应对) · [13. 验收标准](#13-验收标准) ·
 [14. 当前进度与快速开始](#14-当前进度与快速开始) · [15. 参考与术语](#15-参考与术语) · [16. 如何参与](#16-如何参与)
 
-> **本次修订（2026-11-18）**：① 平台收敛为 **Windows-only + Linux 接口预留**；② 渲染唯一后端改为
-> **Vulkan 1.3（`vulkanalia`）**；③ 玩法脚本改用 **C#（.NET）**，彻底移除蓝图/可视化脚本/WASM 方案；
-> ④ **不实现物理引擎**，仅保留 `PhysicsBackend` 接口供外部自研后端接入；⑤ **编辑器与 UI 框架解耦**，
-> 核心逻辑不依赖 egui/GPUI，GPUI 作为候选后端；⑥ **不要求 1:1 迁移**，公共 API 与内部设计优先采用
-> Rust 语言特性。对应设计见 §1.3、§3.5、§4.2、§5.5–§5.7、§9.6、§9.9、§9.15。
+> **修订记录**
+> - **2026-11-18**：① 平台收敛为 **Windows-only + Linux 接口预留**；② 渲染唯一后端改为
+>   Vulkan 1.3（`vulkanalia`）；③ 玩法脚本改用 **C#（.NET）**，移除蓝图/可视化脚本/WASM 方案；
+>   ④ **不实现物理引擎**，仅保留 `PhysicsBackend` 接口供外部自研后端接入；⑤ **编辑器与 UI 框架解耦**，
+>   核心逻辑不依赖 egui/GPUI，GPUI 作为候选后端；⑥ **不要求 1:1 迁移**，公共 API 与内部设计优先采用
+>   Rust 语言特性。
+> - **2026-11-28**：渲染决策由第②条的“唯一 Vulkan 后端”更新为 **wgpu 首选、Vulkan 1.3 保留为回退/显式后端**
+>   （ADR-0014）；本文件其余段落描述当前状态，历史 ADR/RFC/已归档计划中的旧表述保留为当时的决策记录。
+>
+> 对应设计见 §1.3、§3.5、§4.2、§5.5–§5.7、§9.6、§9.9、§9.15。
 
 ---
 
@@ -324,13 +329,13 @@ run():
   公共 API 只暴露跨平台抽象与 `raw-window-handle`。
 - Windows 是唯一可发布实现；Linux 提供占位实现（返回 `Unsupported` 或明确错误）并参与
   `cargo check --target x86_64-unknown-linux-gnu` 编译检查，防止接口被 Windows 专有类型污染。
-- Vulkan（`vulkanalia`）与 winit 本身跨平台；Linux 启用时只替换平台后端、路径策略与设备枚举，
+- wgpu 与 Vulkan（`vulkanalia`）都跨平台；Linux 启用时只替换平台后端、路径策略与设备枚举，
   `mir-render`、`mir-script` 与玩法代码不改。
 - Linux 的运行时验收、打包与支持承诺属于环 2（N6）；当前 CI 只保证「接口不腐烂」。
 
 | 平台 | 当前状态 | 接口/实现 | 发布 |
 |---|---|---|---|
-| Windows x64 | 唯一实现 | 完整平台后端 + Vulkan 1.3 | ✅ 发布 |
+| Windows x64 | 唯一实现 | 完整平台后端 + wgpu / Vulkan 1.3 | ✅ 发布 |
 | Linux x64 | 占位 | 平台 trait + `Unsupported` 实现 + CI 编译检查 | ⬜ 暂不发布（N6） |
 | macOS / 移动端 / 主机 | 不做 | 不维护 | ❌ |
 
@@ -350,18 +355,19 @@ miriya-editor（组合根，选择 UI 后端）
 ├── mir-editor-gpui / mir-editor-egui   # UI 适配层，只做事件/呈现/合成
 ├── mir-editor-ui                       # UI 宿主契约与视口协议
 └── mir-editor-core                     # 文档/命令/Inspector/视口/PIE（UI 无关）
-    └── miriya-engine                   # 运行时与渲染（Vulkan/vulkanalia）
+    └── miriya-engine                   # 运行时与渲染（wgpu / Vulkan）
 ```
 
 - `mir-editor-core`：UI 无关的纯状态机——文档/关卡、选择、命令与撤销、Inspector 模型、视口相机/Gizmo 数学、
   PIE 会话、资产浏览器模型；只依赖引擎运行时与数学/反射，不依赖 winit/Vulkan/egui/GPUI。
 - `mir-editor-ui`：UI 宿主契约（事件翻译、命令/面板映射、视口目标）；`mir-editor-gpui` 与
   `mir-editor-egui` 为可选实现；`miriya-editor` 是组合根，按 feature 选择后端。
-- 视口渲染仍由 `mir-render`（`vulkanalia`）执行；编辑器 UI 只消费渲染结果（引擎自有 surface 或离屏纹理合成）。
+- 视口渲染仍由 `mir-render` 执行（默认 wgpu，可显式切 Vulkan）；编辑器 UI 只消费渲染结果
+  （引擎自有 surface 或离屏纹理合成）。
 - 事件循环由 UI 宿主实现（GPUI 自带；egui 由 winit 等适配层驱动）；PIE 是核心驱动的子会话，
   编辑器 UI 依赖不会进入游戏运行时。
-- 若 GPUI 自带 GPU 渲染器，它只负责编辑器 chrome，不改变游戏/视口的 Vulkan 后端；若无法共享纹理或事件循环，
-  优先实现离屏合成/子表面适配；若要求编辑器 chrome 也必须走 `vulkanalia`，则实现 GPUI-on-Vulkan 适配或改用
+- 若 GPUI 自带 GPU 渲染器，它只负责编辑器 chrome，不改变游戏/视口的渲染后端；若无法共享纹理或事件循环，
+  优先实现离屏合成/子表面适配；若要求编辑器 chrome 也走同一 GPU API，则实现对应后端适配或改用
   自绘 UI，仍不可行时回退 egui（ADR-0009 记录结论）。
 - M12 先做 GPUI 与 egui 的 spike，再由 ADR-0009 选定默认后端；无论选哪个，`mir-editor-core` 必须通过 headless 测试。
 
@@ -498,7 +504,7 @@ Miriya/
 | `CoreUObject`（956） | `mir-reflect` / `mir-object` | P0 | M0、M3 | 近似替代（derive 代替 UHT） |
 | `Engine`（4,007，Actor/Component/World） | `mir-scene` / `mir-gameplay` | P0 | M3、M7 | 行为对齐（Actor 模型） |
 | `MassEntity` / ECS 相关 | `mir-ecs` | P0 | M3 | 近似替代（hecs） |
-| `RHI` + `RenderCore` + `Renderer` | `mir-render` / `mir-shader` | P0 | M2 | 替代（唯一 Vulkan 后端，`vulkanalia`） |
+| `RHI` + `RenderCore` + `Renderer` | `mir-render` / `mir-shader` | P0 | M2 | 替代（wgpu 首选 + `vulkanalia` 回退，内部 enum 分发） |
 | `ApplicationCore` / `Launch` / `Windows` | `mir-platform` / `mir-window` | P0 | M1 | 近似替代（winit） |
 | `InputCore` / Enhanced Input | `mir-input` | P0 | M1、M7 | 行为对齐（Action/MappingContext） |
 | `AssetRegistry` / `Serialization` / `PakFile` | `mir-asset` / `mir-serialize` / `mir-pak` | P0 | M4、M13 | 自有格式 + 只读导入 |
@@ -648,28 +654,30 @@ Miriya/
 - 关卡流式（World Partition 简化）列为 N2；先实现单关卡 + 子场景挂载。
 - 验收：保存→加载→再保存的 golden 一致；Actor 重命名/删除不破坏引用。
 
-### 9.6 `mir-render` / `mir-shader`：Vulkan 渲染（唯一后端）
+### 9.6 `mir-render` / `mir-shader`：双后端渲染（wgpu 首选，Vulkan 回退）
 
-- **后端**：Vulkan 1.3，通过 **`vulkanalia`**。`mir-render` 内部负责实例、物理设备选择、队列、交换链、
-  描述符池/布局、管线、显存、命令缓冲与同步；公共 API 不出现 Vulkan 类型。
+- **后端**：默认 **wgpu**（适配器可落在 Vulkan/DX12 等），失败回退手写 **Vulkan 1.3（`vulkanalia`）**；
+  `EngineConfig::backend` / `--backend=auto|wgpu|vulkan` 可强制指定。`mir-render` 内部用 enum + match
+  静态分发，公共 API 不出现任何图形 API 类型（ADR-0014）。
 - **帧数据边界（ADR-0012）**：应用层提取 `CameraFrame`（view_proj + 相机位置）/ `InstanceData` 后提交，
   `mir-render` 不依赖场景或 ECS；相机放 UBO（set 0）、材质参数放 set 1 UBO、逐实例数据放 push constants。
   视锥剔除发生在应用层 extract（`mir-math::Frustum`/`Aabb`），渲染层不感知剔除。
-- **特性**：动态渲染（dynamic rendering）、synchronization2、timeline semaphore、descriptor indexing；
-  调试构建启用 Khronos validation layer；发布版持久化 pipeline cache 降低首帧卡顿。
-- **帧结构**：2–3 帧在飞行、环形暂存缓冲、**自研显存子分配器**（块/池/延迟回收，基于 `vulkanalia` 的显存类型，
-  不引入 ash）；交换链重建/设备丢失有恢复路径。
+- **特性**：Vulkan 侧为动态渲染、synchronization2、timeline semaphore、descriptor indexing、
+  Khronos 校验层与持久化 pipeline cache；wgpu 侧由 crate 管理同步与资源状态，复用同一套公共帧契约。
+- **帧结构**：2 帧在飞行、环形相机 UBO。Vulkan 侧有自研显存子分配器（块/池/延迟回收，不引入 ash）
+  与 DeletionQueue；wgpu 侧由 crate 跟踪资源生命周期；两后端均有交换链重建路径。
 - **管线**：Clustered Forward+：CSM 阴影 → 深度预通道 → 不透明（PBR + IBL）→ 透明 → SSAO/Bloom/色调映射 → UI。
 - **RenderGraph**：pass 声明读写、自动 barrier/layout 转换与临时纹理别名（Vulkan）；wgpu 自带状态跟踪，
   只消费 pass 序；两后端均支持 GPU pass 时间戳（适配器支持时）与每帧依赖图 dump。
 - **着色器**：Slang（公共 module + `import`）经 `slangc -fvk-use-entrypoint-name` 编译为单个 SPIR-V，
   保留 `vertexMain`/`fragmentMain` 入口名，Rust 侧单 ShaderModule 按入口名绑定；`spirv-reflect` 生成绑定；
   `spirv-val` 与校验层把关；离线缓存以管线哈希为键；开发模式热重载；材质参数走 UBO/SSBO。
-- **平台**：Vulkan 为 Windows/Linux 通用 API；启用 Linux 时只需替换 surface/平台后端，渲染代码不变。
-- **运行前提**：Windows 10/11 x64 + 支持 Vulkan 1.3 的显卡驱动；启动时检测 API/特性并给出可读错误，
-  不提供 DX12 兜底。
+- **平台**：wgpu 与 Vulkan 都可用于 Windows/Linux；启用 Linux 时只需替换 surface/平台后端，渲染代码不变。
+- **运行前提**：Windows 10/11 x64；wgpu 由适配器提供底层 API（本机为 Vulkan，也可能为 DX12），
+  Vulkan 回退路径要求 Vulkan 1.3 驱动；启动检测能力并给出可读错误。
 - 目标：1080p 60fps（中端独显）、1M 三角形、GPU 帧时间 ≤ 16.6 ms；着色器编译不阻塞主循环。
-- 约束：**不引入 wgpu/ash/DX12/OpenGL/Metal**；不做 Lumen/Nanite 等价，GI/虚拟几何在 N3 研究。
+- 约束：**图形后端限定为 wgpu 与手写 Vulkan（`vulkanalia`），不新增第三套原生后端
+  （ash/DX12/OpenGL/Metal）**；不做 Lumen/Nanite 等价，GI/虚拟几何在 N3 研究。
 
 ### 9.7 `mir-asset`：资产服务器
 
@@ -762,7 +770,7 @@ Miriya/
 - **ADR-0009**：M12 spike 后决定默认后端，评估 GPUI 的事件循环/纹理共享/许可证与稳定性；不可行则用 egui
   或自研最简宿主。切换后端不得改动核心逻辑。
 - **不做**：Sequencer/Niagara、蓝图编辑器、内置 C# 代码编辑器（C# 用外部 IDE，见 §9.13）。
-- 验收：核心 headless 测试全绿；选定 UI 后端可编辑/保存/PIE，视口由 vulkanalia 渲染。
+- 验收：核心 headless 测试全绿；选定 UI 后端可编辑/保存/PIE，视口由 `mir-render`（默认 wgpu）渲染。
 
 ### 9.16 `miriya-cli` / `mir-build` / `mir-pak`：工具链
 
@@ -774,7 +782,7 @@ Miriya/
 
 ### 9.17 平台与网络
 
-- 平台：**Windows 首发且当前唯一发布平台（Vulkan 1.3）**；Linux 接口保留并做编译检查，发布留待 N6；
+- 平台：**Windows 首发且当前唯一发布平台（wgpu / Vulkan 1.3）**；Linux 接口保留并做编译检查，发布留待 N6；
   macOS/移动端/主机不做。
 - 平台服务：文件（大小写/长路径/沙箱）、计时、DPI、电源模式、崩溃 minidump（后续）。
 - 网络：N1 用固定步长 + 服务器权威快照；不承诺 UE 复制语义 1:1；先做专用服务器 headless。
@@ -943,7 +951,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 |---|---|---|---|
 | 范围失控（想对齐 UE 全部功能） | 高 | 高 | 同心环 + 里程碑 Gate；非目标写死；每个版本只做垂直切片 |
 | 渲染现代化差距（Lumen/Nanite） | 高 | 中 | 明确不做；先稳定 Forward+；研究项独立分支，不影响主线 |
-| Vulkan 驱动/硬件覆盖（无 DX12 兜底） | 中 | 高 | 明确 Vulkan 1.3 系统要求；NVIDIA/AMD/Intel 矩阵测试；validation layer + `spirv-val`；设备丢失恢复路径；自研分配器做泄漏/碎片测试 |
+| 两后端驱动/适配器覆盖 | 中 | 高 | 默认 wgpu 覆盖更多适配器（含 DX12），显式 Vulkan 1.3 为回退；NVIDIA/AMD/Intel 矩阵测试；校验层 + `spirv-val`；设备丢失恢复；自研分配器泄漏/碎片测试 |
 | 着色器/驱动差异导致画面不一致 | 中 | 中 | SPIR-V 校验 + 多 GPU golden 测试；管线缓存按驱动指纹；可诊断的降级开关 |
 | C#/.NET 互操作、GC 与热重载 | 中 | 高 | 版本化 C ABI、生成绑定、句柄世代校验、边界测试；热重载失败回退 PIE；脚本性能基准 |
 | 资产格式与迁移成本 | 中 | 中 | 自有格式早期定型；导入器优先 glTF；fuzz + 版本迁移工具 |
@@ -965,7 +973,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 
 **功能**
 
-- [ ] Windows x64（Vulkan 1.3）上，用 Miriya 从零搭建并运行一个第一人称/第三人称示例
+- [ ] Windows x64（wgpu 或显式 Vulkan 1.3）上，用 Miriya 从零搭建并运行一个第一人称/第三人称示例
       （移动、跳跃、射击、HUD、音效；物理行为由外部后端提供），玩法逻辑由 C# 编写；
       Linux 仅要求平台接口通过编译检查。
 - [ ] C# 脚本：`miriya build` 可编译、宿主可加载、PIE 中热重载 ≤ 1 s、发布包无需安装 .NET SDK 即可运行；
@@ -1019,7 +1027,7 @@ Vulkan GPU 测试允许在无硬件时跳过并显式标注（不得静默通过
 - [x] 补齐工程基础设施：`LICENSE-MIT`、`LICENSE-APACHE`、`global.json` 与基础 GitHub Actions CI
   （Windows: fmt/clippy/test + .NET 11 构建；Linux: `cargo check`）。
 - [x] 主循环支持 `max_frames`，示例 `miriya-app` 可通过 `--frames N` 自动退出，不再只能 Ctrl+C 强杀。
-- [x] 渲染/窗口子系统文档注释已对齐唯一后端 `vulkanalia` / `winit` 规划。
+- [x] 渲染/窗口子系统文档注释已对齐当时的 `vulkanalia` / `winit` 规划。
 - [x] **M1 平台与循环**：`mir-window` 接入 winit 0.30 真实窗口与事件循环；键位映射覆盖字母/数字/F1–F12/
   方向键/修饰键；`mir-input` 补全鼠标按键沿与失焦清理；窗口关闭、Esc、`max_frames` 均可退出主循环。
 - [x] 帧统计 `FrameStats`（帧数、平滑 FPS、帧耗时）接入 `EngineContext`；`Engine::run_headless` 支持
@@ -1158,6 +1166,11 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
       收敛到 `mir-math`，演示单位按 ADR-0012 校准为厘米。Gate 与验收记录见 `docs/plans/m3-scene-ecs.md`。
 - [x] **M4（资产管线）**：UUIDv7 AssetId、注册表/依赖图/缓存分离、rayon 异步加载、`.miasset` 分块 zstd 容器、
   GLB/PNG/KTX2/WAV/OGG 导入、notify 热重载与 `miriya-cli cook`；Gate 与验收记录见 `docs/plans/m4-asset-pipeline.md`。
+- [x] **wgpu 首选双后端（2026-11-28）**：`mir-render` 默认 `wgpu → Vulkan` 自动回退，`--backend` 可强制指定；
+  共享帧契约/世代槽位/RenderGraph 声明；wgpu 支持窗口/headless、资源上传与 GPU pass 时间戳
+  （适配器支持时）。决策与验收见 ADR-0014。
+- [x] **M5 批次 A（纹理基础设施）**已完成；批次 B（材质纹理绑定 + 多光源）待启动，计划见
+      `docs/plans/m5-material-lighting.md`（需按 ADR-0014 补充 wgpu 侧对等实现）。
 - [ ] **M5–M13**：按 §8.2 依次推进光照、物理接口胶水、游戏框架、C# 脚本、音频、动画、UI、编辑器与打包。
 - [ ] 本 README 的进度表接入里程碑看板（issue/项目面板）；每次里程碑结束同步 §14 与 `docs/plans/`。
 
@@ -1189,9 +1202,9 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 | Rust 优先 | 在语义等价时优先所有权/newtype/enum/trait/Result 等 Rust 惯用法（§1.3/§4.2） |
 | Actor / Component | 关卡中的对象及其可组合能力；Miriya 用「实体 + 组件 + 元数据」实现 |
 | PIE | Play In Editor，编辑器内运行游戏 |
-| Vulkan / vulkanalia | Miriya 唯一的图形后端；vulkanalia 是 Rust 的 Vulkan 绑定与辅助层 |
+| wgpu / Vulkan / vulkanalia | wgpu 为默认首选后端，手写 Vulkan 1.3 为回退/显式后端；vulkanalia 是 Rust 的 Vulkan 绑定层 |
 | Slang | Miriya 的唯一着色器源语言；支持 module/import，经 `slangc` 直接生成 SPIR-V |
-| SPIR-V | Vulkan 使用的着色器中间格式；Miriya 由 Slang 经 `slangc` 直接编译得到 |
+| SPIR-V | Vulkan 生态的着色器中间格式；Miriya 由 Slang 经 `slangc` 编译后供两后端共用 |
 | C# / .NET 11 | 唯一的玩法脚本语言与运行时；通过 hostfxr 在引擎进程内托管 |
 | PhysicsBackend | 外部物理后端契约；Miriya 只提供接口、调度与契约测试，不含求解器 |
 | mir-editor-core / UI 后端 | 编辑器核心（UI 无关）与可插拔 UI 适配层（GPUI/egui），后者不进入运行时 |
@@ -1213,8 +1226,9 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 2. **选题**：优先看 §14.4 的 M0 清单与里程碑 Gate；新手任务标注 `good first issue`。
 3. **架构变更**：涉及公共 API、crate 边界、资产格式、坐标约定者，先提 RFC/ADR，再写代码。
    **不做 1:1 C++ 移植；API 与实现优先 Rust 惯用法（§4.2）。平台/图形/脚本/物理/编辑器约束已定：
-   Windows-only（Linux 接口保留）、唯一 Vulkan 后端（vulkanalia）、C# 脚本（无蓝图）、物理只留接口
-   （外部后端）、编辑器核心与 UI 框架解耦；不接受引入 wgpu/ash/DX12、第二脚本系统或内置物理求解器。**
+   Windows-only（Linux 接口保留）、wgpu 首选 + Vulkan（vulkanalia）回退的双后端、C# 脚本（无蓝图）、
+   物理只留接口（外部后端）、编辑器核心与 UI 框架解耦；不接受新增第三套原生图形后端、第二脚本系统
+   或内置物理求解器。**
 4. **提交**：Conventional Commits；PR 必须含测试、文档与基准（如涉及性能）；C# 变更同样需要测试与评审。
 5. **评审**：每个 PR 至少一名非作者评审；渲染/物理接口/资产解析/C# 互操作/编辑器核心变更需对应 owner 复核；
    公共 API 需通过 Rust 惯用法检查（无 C++ 式样板、无多余 `dyn`/`unsafe`）。
@@ -1222,5 +1236,5 @@ M8 起还需要 .NET 11 SDK 编译 C# 脚本。
 
 ---
 
-> **文档维护**：Miriya 团队 · 最后更新 2026-11-26
+> **文档维护**：Miriya 团队 · 最后更新 2026-11-28
 > 本文件是**规划**，不代表上述能力已经完成；进度以 §14 为准，变更以 ADR 为准。

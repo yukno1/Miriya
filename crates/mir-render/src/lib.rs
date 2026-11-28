@@ -1,8 +1,9 @@
 //! 渲染子系统：wgpu 首选、Vulkan 1.3（`vulkanalia`）保留的双后端（ADR-0014）。
 //!
 //! 公共 API 不暴露任何图形 API 类型；`WgpuCore` / `VulkanCore` 完全封装在 crate 内部。
-//! 两个后端共用纯数据帧契约、RenderGraph 声明与世代句柄表；Vulkan 侧保留完整
-//! barrier 推导、GPU pass 时间戳、管线缓存与自研显存子分配器。
+//! 两个后端共用纯数据帧契约、RenderGraph 声明与世代句柄表；GPU pass 时间戳在
+//! 适配器支持时两后端均可报告。Vulkan 侧保留完整 barrier 推导、管线缓存与
+//! 自研显存子分配器。
 //!
 //! 无窗口（headless）路径不会创建 surface，也不会要求交换链扩展，
 //! 因此 `mir-core` 的 `run_headless` 与 CI 仍然可用。

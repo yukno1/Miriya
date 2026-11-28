@@ -1,13 +1,17 @@
 # M5 任务清单（材质与光照：纹理 → 材质绑定/多光源 → RenderGraph 多 pass → Bloom/SSAO → IBL → CSM → v0.3 PBR Scene）
 
 - 日期：2026-11-27（批次 0：计划与复核同日完成）
-- 状态：**批次 A 完成（R-01–R-03 落地，Gate 1 通过）——待批次 B 启动**（2026-11-27）
+- 状态：**批次 A 完成（R-01–R-03 落地，Gate 1 通过）——待批次 B 启动**（2026-11-27；2026-11-28 同步双后端前提）
 - 上游依据：`README.md` §8.2（M5）/ §8.3（v0.3 PBR Scene）/ §9.6 / §14.2；
   `docs/plans/m2-remaining.md`（RenderGraph/子分配器/材质雏形交接）、`docs/plans/m4-asset-pipeline.md` §5（M5 交接清单）；
-  ADR-0004（RenderGraph）、ADR-0011（Slang）、ADR-0012（帧数据/提交边界）、ADR-0013（资产管线）。
-- 约束：Windows x64 + Vulkan 1.3（vulkanalia）、Slang 单 `.spv` 多入口、单 graphics 队列；
-  `mir-render` 公共 API 不出现 Vulkan 类型（ADR-0012）；显存一律走自研子分配器 + DeletionQueue；
-  不引入 ash/VMA/第二图形后端；资产层只产出纯数据，GPU 创建由渲染层完成。
+  ADR-0004（RenderGraph）、ADR-0011（Slang）、ADR-0012（帧数据/提交边界）、ADR-0013（资产管线）、
+  ADR-0014（wgpu 首选双后端，取代本计划写作时的单后端约束）。
+- 约束：Windows x64 + **wgpu 首选 / Vulkan 1.3（vulkanalia）回退**、Slang 单 `.spv` 多入口、单 graphics 队列；
+  `mir-render` 公共 API 不出现任何图形 API 类型（ADR-0012）；Vulkan 侧显存走自研子分配器 + DeletionQueue，
+  wgpu 侧由 crate 跟踪资源生命周期；不引入 ash/VMA/第三套原生图形后端；资产层只产出纯数据，
+  GPU 创建由渲染层完成。
+- **批次 B 起的双后端要求**：本计划 R-04 之后的每项渲染能力都需在默认 wgpu 路径可用，Vulkan 侧保持等价；
+  涉及新绑定/管线状态时同时更新 `wgpu/pipeline.rs` 与 `vulkan/pipeline.rs`。细节以 ADR-0014 为准。
 - 估算：**约 24 净人日**（批次 A 3.0 + B 3.0 + C 4.0 + D 3.0 + E 4.0 + F 3.5 + G 2.5，含 1.0 冗余）
 
 ## 1. 目标与 Gate
